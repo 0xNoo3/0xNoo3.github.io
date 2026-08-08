@@ -1,0 +1,209 @@
+---
+---
+
+@use 'abstracts/variables' with (
+  $theme: '{{ site.theme_mode }}'
+);
+
+/* prettier-ignore */
+@use 'main
+{%- if jekyll.environment == 'production' -%}
+  .bundle
+{%- endif -%}
+';
+
+/* ==========================================================================
+   Custom syntax highlighting: One Dark Pro (dark mode only)
+   --------------------------------------------------------------------------
+   The theme's dark scheme (`rougify style base16.dark`) only colors a subset
+   of Rouge tokens. Identifiers (.n), builtins (.nb), function names (.nf/.fm)
+   and variables (.nv...) have no rule, so in dark mode most Python code
+   renders as flat grey (--code-color: #b0b0b0).
+
+   This override restyles the dark-mode code-block TOKEN COLORS with the One
+   Dark Pro palette (https://github.com/Binaryify/OneDark-Pro), covering every
+   Rouge token class: keywords #c678dd, strings #98c379, numbers #d19a66,
+   functions/builtins #61afef, classes #e5c07b, identifiers #abb2bf,
+   operators #56b6c2, comments #7f848e.
+   The code-block background, line numbers and base text are left untouched
+   (theme defaults). Light mode is untouched — it already ships the full
+   GitHub palette.
+   ========================================================================== */
+
+@mixin dark-syntax-colors {
+  .highlight {
+    /* identifiers */
+    .n,
+    .ni {
+      color: #e06c75;
+    }
+
+    .p,
+    .pi {
+      color: #abb2bf;
+    }
+
+    /* comments */
+    .c,
+    .ch,
+    .cd,
+    .cm,
+    .cpf,
+    .c1,
+    .cs {
+      color: #7f848e;
+    }
+
+    /* preprocessor directive */
+    .cp {
+      color: #e5c07b;
+    }
+
+    /* keywords */
+    .k,
+    .kd,
+    .kn,
+    .kp,
+    .kr,
+    .kv {
+      color: #c678dd;
+    }
+
+    .kc {
+      color: #d19a66;
+    }
+
+    .kt {
+      color: #e5c07b;
+    }
+
+    /* names */
+    .nb {
+      color: #61afef; /* builtins (print, len, ...) */
+    }
+
+    .bp {
+      color: #abb2bf; /* builtin pseudo (self, cls) */
+    }
+
+    .nf,
+    .fm {
+      color: #61afef; /* function names */
+    }
+
+    .nc,
+    .nn,
+    .no,
+    .ne,
+    .nl,
+    .py {
+      color: #e5c07b; /* classes */
+    }
+
+    .nd {
+      color: #61afef; /* decorators */
+    }
+
+    .na {
+      color: #d19a66; /* attributes */
+    }
+
+    .nt {
+      color: #e06c75; /* tags */
+    }
+
+    .nv,
+    .vc,
+    .vg,
+    .vi,
+    .vm {
+      color: #e06c75; /* variables */
+    }
+
+    /* strings & numbers */
+    .s,
+    .sa,
+    .sb,
+    .sc,
+    .dl,
+    .sd,
+    .s2,
+    .sh,
+    .sx,
+    .s1,
+    .ss,
+    .sr,
+    .l,
+    .ld {
+      color: #98c379;
+    }
+
+    .si,
+    .se {
+      color: #56b6c2; /* string interpolation / escapes */
+    }
+
+    .m,
+    .mb,
+    .mf,
+    .mh,
+    .mi,
+    .il,
+    .mo,
+    .mx {
+      color: #d19a66;
+    }
+
+    /* operators */
+    .o,
+    .ow {
+      color: #56b6c2;
+    }
+
+    /* errors */
+    .err {
+      color: #f44747;
+    }
+
+    /* diff / generic */
+    .gi {
+      color: #98c379;
+    }
+
+    .gd {
+      color: #e06c75;
+    }
+
+    .gh,
+    .gu {
+      color: #61afef;
+      font-weight: bold;
+    }
+
+    .ge {
+      color: #abb2bf;
+      font-style: italic;
+    }
+
+    .gs {
+      color: #abb2bf;
+      font-weight: bold;
+    }
+
+    .gl,
+    .gt,
+    .gr {
+      color: #7f848e;
+    }
+  }
+}
+
+:root[data-bs-theme='dark'] {
+  @include dark-syntax-colors;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-bs-theme]) {
+    @include dark-syntax-colors;
+  }
+}

@@ -80,4 +80,61 @@ asmcfg = mdis.dis_multiblock(addr) # whole assembly control flow graph
 lifter = machine.lifter_model_call(loc_db=loc_db) # initialization of the lifter 
 ircfg = lifter.new_ircfg_from_asmcfg(asmcfg=asmcfg) # lifting x86 asmcfg to miasm's own IR-CFG
 ```
+> These are the initialization stage of miasm (almost) every time we will do this so i might skip later
 
+```py
+open('asmcfg.dot', 'w').write(asmcfg.dot()); open('ircfg', 'w').write(ircfg.dot())
+```
+
+we can also view the asmcfg and ircfg like this
+
+the asmcfg is similar as you saw as it is x86 assembly
+
+![](2026-08-08-21-32-28.png)
+
+But [Miasm's IR](https://miasm.re/blog/2019/01/16/miasm_ir_getting_higher.html) is a lil complicated you can say:
+
+
+![](2026-08-08-21-40-09.png)
+
+You will later see in this blog that Hexrays IR also has Explicit semantics for EFLAGS after each computation instruction.This is Because the IR needs to be a complete, self-contained semantic model of the instruction — including side effects so that later analysis (symbolic execution, optimization) is correct without needing hidden/implicit CPU behavior.
+
+So we will do [Dead Removal](https://en.wikipedia.org/wiki/Dead-code_elimination) and [Constant Propagation](https://www.geeksforgeeks.org/compiler-design/constant-propagation-in-complier-design/) using miasm.
+
+```py
+deadrm = DeadRemoval(lifter=lifter)  # create dead-code elimination pass for this lifter
+entry_points = set([mdis.loc_db.get_offset_location(addr)])  # get LocKey used as CFG entry point
+init_infos = lifter.arch.regs.regs_init  # initial symbolic values for all registers
+
+# runs constant propagation over the IR CFG starting from addr with the given initial register state, folding known constant values through expressions.
+cst_propag_link = propagate_cst_expr(lifter, ircfg, addr, init_infos)
+
+modified = True
+while modified:  # keep optimizing until no more changes occur
+    modified = False
+    modified |= deadrm.do_dead_removal(ircfg=ircfg)      # remove unused/dead IR assignments
+    modified |= remove_empty_assignblks(ircfg)           # remove blocks left empty after dead removal
+    modified |= merge_blocks(ircfg, entry_points)         # merge mergeable blocks to simplify CFG
+
+
+open(f'ircfg_simplified.dot', 'w').write(ircfg.dot()) # constant propagated, clean unobfuscated ir
+
+```
+Here is the IRCFG now !
+
+![](2026-08-08-21-55-05.png)
+
+So now on this basic example the dead code is removed and optimized
+
+> Unfortunately Miasm IR is not backword compatible to x86, so we can't just recompile the clean binary, tho it "had" conversion to LLVM IR but this is also broken in latest Miasm versions due to the use of depreciated LLVM-Lite APIs
+{:.prompt-info}
+
+The full script can be found [here](https://gist.github.com/0xNoo3/c879a676e19d8f2a879f89165424a781#file-01_dead_code_elim-py)
+
+## Opaque Predicates
+
+In computer programming, an opaque predicate is a predicate, an expression that evaluates to either "true" or "false", for which the outcome is known by the programmer a priori, but which, for a variety of reasons, still needs to be evaluated at run time.
+
+> from wiki
+
+so its just having multiple Basic Blocks that are never executed because the 
