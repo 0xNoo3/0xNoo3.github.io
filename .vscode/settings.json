@@ -1,4 +1,8 @@
 {
+  "pasteImage.path": "${projectRoot}/assets/posts/${currentFileNameWithoutExt}",
+  "pasteImage.basePath": "${projectRoot}/assets/posts/${currentFileNameWithoutExt}",
+  "pasteImage.forceUnixStyleSeparator": true,
+  "pasteImage.prefix": "",
   // Prettier
   "editor.defaultFormatter": "esbenp.prettier-vscode",
   "editor.formatOnSave": true,
