@@ -1733,7 +1733,44 @@ for i, b in enumerate(data):
 
 While analysis of handlers to understand some semantics of handlers so we can write a disassembler. All the handlers are simple/simmilar enough, one handler was a little of so lets see that that is.
 
-![](2026-08-11-19-12-53.png)
+```c
+char __thiscall sub_40F2E2(vm *this)
+{
+  char v2; // bl
+  unsigned __int8 op; // al
+  _BYTE *vpc; // ecx
+  unsigned __int8 n_op; // dl
+  char v6; // bl
+  int init_buffer; // eax
+  int v8; // edi
+  int v9; // eax
+  char *v10; // esi
+  int buffer[65]; // [esp+Ch] [ebp-108h] BYREF
+  unsigned __int8 next_op; // [esp+112h] [ebp-2h]
+  unsigned __int8 v14; // [esp+113h] [ebp-1h]
+
+  v2 = this->vpc[3];
+  op = this->vpc[1];
+  vpc = this->vpc;
+  n_op = vpc[2];
+  v14 = op;
+  v6 = v2 ^ 0xCC;
+  next_op = n_op;
+  init_buffer = sub_409281((int)buffer, vpc + 3, op);
+  v8 = next_op;
+  sub_4092E4(init_buffer, (int)this->mem, next_op);
+  v9 = v14;
+  this->mem += v8;
+  this->vpc += v9 + 3;
+  v10 = this->vpc;
+  if ( *v10 < 0 )
+    *v10 = (v6 ^ *v10) & 0x7F;
+  return 1;
+}
+
+```
+
+And these two inside functions are:
 
 ```c
 int __userpurge sub_409281@<eax>(int result@<eax>, int a2, __int16 a3)
@@ -1795,3 +1832,550 @@ int __userpurge sub_4092E4@<eax>(int result@<eax>, int a2, unsigned int a3)
 
 ```
 
+After analyzing them we know its RC4 handler:
+
+```c
+char __thiscall h_rc4_handler(vm *this)
+{
+  char v2; // bl
+  unsigned __int8 op; // al
+  _BYTE *vpc; // ecx
+  unsigned __int8 n_op; // dl
+  char v6; // bl
+  int init_buffer; // eax
+  int v8; // edi
+  int v9; // eax
+  char *v10; // esi
+  int buffer[65]; // [esp+Ch] [ebp-108h] BYREF
+  unsigned __int8 next_op; // [esp+112h] [ebp-2h]
+  unsigned __int8 v14; // [esp+113h] [ebp-1h]
+
+  v2 = this->vpc[3];
+  op = this->vpc[1];
+  vpc = this->vpc;
+  n_op = vpc[2];
+  v14 = op;
+  v6 = v2 ^ 0xCC;
+  next_op = n_op;
+  init_buffer = mw_rc4_KSA((int)buffer, vpc + 3, op);
+  v8 = next_op;
+  mw_rc4_decrypt(init_buffer, (int)this->mem, next_op);
+  v9 = v14;
+  this->mem += v8;
+  this->vpc += v9 + 3;
+  v10 = this->vpc;
+  if ( *v10 < 0 )
+    *v10 = (v6 ^ *v10) & 0x7F;
+  return 1;
+}
+```
+> RC4 Key Scheduling algorithm
+
+```c
+int __userpurge mw_rc4_KSA@<eax>(_BYTE *buffer@<eax>, _BYTE *nn_op_key, __int16 op_ksz)
+{
+  int ii; // ecx
+  _BYTE *buffer_ptr; // esi
+  char *buff_ptr; // esi
+  int size; // edi
+  char idx; // dl
+  unsigned __int8 value; // [esp+Eh] [ebp-2h]
+  unsigned __int8 k_idx; // [esp+Fh] [ebp-1h]
+
+  ii = 0;
+  k_idx = 0;
+  value = 0;
+  *((_WORD *)buffer + 128) = 0;
+  buffer_ptr = buffer;
+  do
+    *buffer_ptr++ = ii++;
+  while ( (unsigned __int16)ii < 256u );
+  buff_ptr = buffer;
+  size = 256;
+  do
+  {
+    idx = *buff_ptr;
+    value += *buff_ptr + nn_op_key[k_idx++];
+    *buff_ptr = buffer[value];
+    buffer[value] = idx;
+    if ( k_idx == op_ksz )
+      k_idx = 0;
+    ++buff_ptr;
+    --size;
+  }
+  while ( size );
+  return (int)buffer;
+}
+```
+> RC4 Decrypt 
+
+```c
+void __userpurge mw_rc4_decrypt(_BYTE *init_buffer@<eax>, _BYTE *mem, unsigned int n_op_sz)
+{
+  unsigned int idx; // edi
+  char v4; // dl
+  unsigned __int8 i; // [esp+6h] [ebp-2h]
+  unsigned __int8 v6; // [esp+7h] [ebp-1h]
+
+  v6 = init_buffer[256];
+  idx = 0;
+  for ( i = init_buffer[257]; idx < n_op_sz; ++idx )
+  {
+    v4 = init_buffer[++v6];
+    i += v4;
+    init_buffer[v6] = init_buffer[i];
+    init_buffer[i] = v4;
+    mem[idx] ^= init_buffer[(unsigned __int8)(v4 + init_buffer[v6])];
+  }
+  init_buffer[256] = v6;
+  init_buffer[257] = i;
+}
+```
+
+Its decrypting the memory in place, so we have to execute the sun function in the handler. But when we lift the ircfg from asmcfg, the calls are not followed, So when we run symbolic execution, that call is not executed symbolically. But in this case we do need to execute the whole handler end to end including the function as KSA and Decrypt used in here. So we will use a dictonary which will contains the ircfg of each handler, We will prelift the RC4 Handler with follow call so the ircfg can follow its callee too, and the decryption will happen in the Symbolic Execution Engine memory, this will save the time as the disassembler will only have to lift each handler once and then reuse it. when ever the virtual machine symbolic execution needs.
+
+
+```py
+RC4_H = 0x40F2E2
+LIFTED = {}
+
+# prelifting rc4 handler
+mdis.follow_call = True
+rc4asmcfg = mdis.dis_multiblock(RC4_H)
+rc4ircfg = unmod_lifter.new_ircfg_from_asmcfg(rc4asmcfg)
+mdis.follow_call = False
+LIFTED[RC4_H] = rc4ircfg
+
+# lifted will be called on each handler
+def lifted(addr):
+    if addr in LIFTED:
+        return LIFTED[addr] # if that particular handler is pre-lifted
+    asmcfg = mdis.dis_multiblock(addr) 
+    ircfg = lifter.new_ircfg_from_asmcfg(asmcfg=asmcfg)
+    LIFTED[addr] = ircfg # if not than lift and store for future
+    return ircfg
+
+```
+
+Now we will simulate the vm loop, starting from the vm bytecode, and each loop will perform symbolic execution on each of the handler and on each iteration we will call the disassemble function, which will check which handler is next pick its mnemonic from the VM Handler dictonary. This will log the handler semantic in the form of the instruction, I am not including the analysis of handlers as they are 69 and its left for the reader as exercise xD.
+
+> Simulation of the vm loop
+
+```py
+
+
+HALT = False
+while not HALT: # vm dispatcher
+    idx = int(read_value_n(ctx(VIP))) # reads Virtual Instruction pointer and derefrence 8 bits (1st byte which is at the start of symbolic execution engine) 
+    disassemble(idx) # log the handler semantics in a text file
+    handler_addr = HANDLERS[idx][0] 
+    ircfg = lifted(handler_addr)
+    if handler_addr == 0x40EE37: HALT = True # halt handler 
+    sb.symbols[lifter.arch.regs.ECX] = ExprInt(VM_CTX, 32) # each handler has vm context in the first argument as its a __thiscall we store it in ecx
+    sb.symbols[lifter.arch.regs.ESP] = ExprInt(STACK_TOP - 4, 32) # set a flag constant so symbolic execution exits cleanly on handler return 
+    q = deque([ExprInt(handler_addr, 32)]) # adding the handler to be executed
+    symbolic_execution(q, ircfg)
+
+
+def symbolic_execution(q, ircfg):
+    while q: # symbolically execute all the BB of the handlers
+        handler_bb = q.popleft()
+        r = sb.run_block_at(ircfg=ircfg, addr=handler_bb)
+        # print(r)
+        if r.is_int() and int(r) == RETN: # handler ended
+            break 
+        elif r.is_int() or r.is_loc():
+            q.append(r)
+
+```
+
+### C2 config download URL 
+
+> After executing our script we have compelete disassembly (3k LOC) of the zeus VM which you can see [here](https://gist.github.com/0xNoo3/c879a676e19d8f2a879f89165424a781#file-08_zeus_disasm-asm),
+
+![](2026-08-11-21-12-56.png)
+_clean disassembly_
+
+There are many RC4 decrytion on the memory, So lets read the memory and see what decrypted inside.
+
+```py
+data = bytearray()
+for i in range(0x288):
+    v = read_value_n(ExprInt(MEMCODE + i, 32), 8) 
+    data.append(int(v))
+open('mem_dec.bin', 'wb').write(data) # writes the decrypted MEMCODE
+```
+
+
+![](2026-08-11-21-16-07.png)
+_Decrypted Memcode_
+
+Indeed we get something usefull in the memory. its .cfg `http://rxfkxmtqxg.com/ppcrzaezqs/cfg.bin` We have succesfully extrated the zeus C2 config download URL 
+
+> Here is the complete zeus vm deobfuscation script
+
+```py
+from miasm.core.locationdb import LocationDB
+from miasm.analysis.binary import Container
+from miasm.analysis.machine import Machine
+from miasm.expression.simplifications import expr_simp
+from miasm.ir.symbexec import SymbolicExecutionEngine
+from miasm.expression.expression import ExprId, ExprMem, ExprInt
+from collections import deque
+
+VM_CTX = 0x10000000      # arbitrary address
+VIP, MEM, FLAG, REG = 0x00, 0x04, 0x08, 0x0C # struct offsets
+BYTECODE = 0x403368
+MEMCODE = 0x4030E0
+STACK_TOP = 0x1000
+RETN = 0xDEADBEEF
+RC4_H = 0x40F2E2
+LIFTED = {}
+
+loc_db = LocationDB()
+container = Container.from_stream(open('zeusvm.bin', 'rb'), loc_db=loc_db)
+machine = Machine(container.arch)
+lifter = machine.lifter_model_call(loc_db=loc_db)
+unmod_lifter = machine.lifter(loc_db=loc_db)
+sb = SymbolicExecutionEngine(lifter=lifter)
+mdis = machine.dis_engine(container.bin_stream, loc_db=loc_db)
+
+# prelifting rc4 handler
+mdis.follow_call = True
+rc4asmcfg = mdis.dis_multiblock(RC4_H)
+rc4ircfg = unmod_lifter.new_ircfg_from_asmcfg(rc4asmcfg)
+mdis.follow_call = False
+LIFTED[RC4_H] = rc4ircfg
+
+def write_address(addr, val, size=32):
+    sb.symbols[ExprMem(ExprInt(addr, 32), size)] = ExprInt(val, size)
+
+def lifted(addr):
+    if addr in LIFTED:
+        return LIFTED[addr]
+    asmcfg = mdis.dis_multiblock(addr)
+    ircfg = lifter.new_ircfg_from_asmcfg(asmcfg=asmcfg)
+    LIFTED[addr] = ircfg
+    return ircfg
+
+def symbolic_execution(q, ircfg):
+    while q: # symbolically execute all the BB of the handlers
+        handler_bb = q.popleft()
+        r = sb.run_block_at(ircfg=ircfg, addr=handler_bb)
+        # print(r)
+        if r.is_int() and int(r) == RETN: # handler ended
+            break 
+        elif r.is_int() or r.is_loc():
+            q.append(r)
+
+ctx = lambda off: expr_simp(sb.eval_expr(ExprMem(ExprInt(VM_CTX + off, 32), 32)))
+read_value_n = lambda addr_expr, size=8: expr_simp(sb.eval_expr(ExprMem(expr_simp(addr_expr), size)))
+
+# just included the mnemonics (i don't know why, i could have written them in the disassemble function too lol)
+HANDLERS = {
+    0x0:  (0x40ede0, 'NOP1'),
+    0x1:  (0x40edfb, 'NOP2'),
+    0x2:  (0x40ee19, 'NOP3'),
+    0x3:  (0x40ee3a, 'XOR BYTE PTR'), 
+    0x4:  (0x40ee64, 'XOR WORD PTR'),
+    0x5:  (0x40ee92, 'XOR DWORD PTR'),
+    0x6:  (0x40eebe, 'ADD BYTE PTR'),
+    0x7:  (0x40eee8, 'ADD WORD PTR'),
+    0x8:  (0x40ef16, 'ADD DWORD PTR'),
+    0x9:  (0x40ef42, 'SUB BYTE PTR'),
+    0xa:  (0x40ef6c, 'SUB WORD PTR'),
+    0xb:  (0x40ef9a, 'SUB DWORD PTR'),
+    0xc:  (0x40efc6, 'ROL BYTE PTR'),
+    0xd:  (0x40effd, 'ROL WORD PTR'),
+    0xe:  (0x40f038, 'ROL DWORD PTR'),
+    0xf:  (0x40f070, 'ROR BYTE PTR'),
+    0x10: (0x40f0a7, 'ROR WORD PTR'),
+    0x11: (0x40f0e2, 'ROR DWORD PTR'),
+    0x12: (0x40f11a, 'NOT BYTE PTR'),
+    0x13: (0x40f13e, 'NOT WORD PTR'),
+    0x14: (0x40f164, 'NOT DWORD PTR'),
+    0x15: (0x40f189, 'SHUFFLE MEM[0-4]'),
+    0x16: (0x40f2e2, 'RC4 DECRYPT'),
+    0x17: (0x40f1e2, 'MOV FLAG'),
+    0x18: (0x40f208, 'MOV FLAG'),
+    0x19: (0x40f230, 'MOV FLAG'),
+    0x1a: (0x40f257, 'ADD WORD MEM'),
+    0x1b: (0x40f27f, 'JNZ'),
+    0x1c: (0x40f2af, 'JNZ'),
+    0x1d: (0x40f348, 'MOV REG'),
+    0x1e: (0x40f379, 'MOV REG'),
+    0x1f: (0x40f3a7, 'MOV REG'),
+    0x20: (0x40f3d4, 'MOV REG'),
+    0x21: (0x40f409, 'MOV REG'),
+    0x22: (0x40f43e, 'MOV REG'),
+    0x23: (0x40f472, 'ADD REG'),
+    0x24: (0x40f4a9, 'ADD REG'),
+    0x25: (0x40f4e0, 'ADD REG'),
+    0x26: (0x40f5a8, 'SUB REG'),
+    0x27: (0x40f5df, 'SUB REG'),
+    0x28: (0x40f616, 'SUB REG'),
+    0x29: (0x40f6de, 'XOR REG'),
+    0x2a: (0x40f715, 'XOR REG'),
+    0x2b: (0x40f74c, 'XOR REG'),
+    0x2c: (0x40f516, 'ADD REG'),
+    0x2d: (0x40f549, 'ADD REG'),
+    0x2e: (0x40f579, 'ADD REG'),
+    0x2f: (0x40f64c, 'SUB REG'),
+    0x30: (0x40f67f, 'SUB REG'),
+    0x31: (0x40f6af, 'SUB REG'),
+    0x32: (0x40f782, 'XOR REG'),
+    0x33: (0x40f7b5, 'XOR REG'),
+    0x34: (0x40f7e5, 'XOR REG'),
+    0x35: (0x40f946, 'ADD BYTE PTR'),
+    0x36: (0x40f97c, 'ADD WORD PTR'),
+    0x37: (0x40f9b5, 'ADD DWORD PTR'),
+    0x38: (0x40f9ec, 'ADD BYTE PTR'),
+    0x39: (0x40fa22, 'ADD WORD PTR'),
+    0x3a: (0x40fa5b, 'ADD DWORD PTR'),
+    0x3b: (0x40fa92, 'XOR BYTE PTR'),
+    0x3c: (0x40fac8, 'XOR WORD PTR'),
+    0x3d: (0x40fb01, 'XOR DWORD PTR'),
+    0x3e: (0x40f814, 'MOV REG'),
+    0x3f: (0x40f845, 'MOV REG'),
+    0x40: (0x40f876, 'MOV REG'),
+    0x41: (0x40f8a6, 'MOV BYTE PTR'),
+    0x42: (0x40f8da, 'MOV WORD PTR'),
+    0x43: (0x40f911, 'MOV DWORD PTR'),
+    0x44: (0x40ee37, 'HALT')
+}
+
+dis = open('dis_vm.asm', 'w')
+def disassemble(idx):
+    vip = ctx(VIP); mem = ctx(MEM); flag = ctx(FLAG); op = vip + ExprInt(1, 32); imm = vip + ExprInt(2, 32)
+    op8 = read_value_n(op); op16 = read_value_n(op, 16); op32 = read_value_n(op, 32)
+    imm8 = read_value_n(imm); imm16 = read_value_n(imm, 16); imm32 = read_value_n(imm, 32)
+    m8 = read_value_n(mem); m16 = read_value_n(mem, 16); m32 = read_value_n(mem, 32)
+
+    mnem = HANDLERS[idx][1]; hd_addr = HANDLERS[idx][0]; loc = f'0x{int(vip):X}: '
+    if mnem.startswith('NOP'):
+        dis.write(loc+f'{mnem}\n')
+    elif hd_addr == 0x40ee3a: #  XOR BYTE PTR [MEM], OP
+        dis.write(loc+f'{mnem} [{mem}], {op8}; [{mem}] = {m8}\n')
+    elif  hd_addr == 0x40ee64: # XOR WORD PTR [MEM], OP
+        dis.write(loc+f'{mnem} [{mem}], {op16}; [{mem}] = {m16}\n')
+    elif hd_addr == 0x40ee92: # XOR DWORD PTR [MEM], OP
+        dis.write(loc+f'{mnem} [{mem}], {op32}; [{mem}] = {m32}\n')
+    elif hd_addr == 0x40eebe: # ADD BYTE PTR [MEM], OP
+        dis.write(loc+f'{mnem} [{mem}], {op8}; [{mem}] = {m8}\n')
+    elif hd_addr == 0x40eee8: # ADD WORD PTR [MEM], OP
+        dis.write(loc+f'{mnem} [{mem}], {op16}; [{mem}] = {m16}\n')
+    elif hd_addr == 0x40ef16: # ADD DWORD PTR [MEM], OP
+        dis.write(loc+f'{mnem} [{mem}], {op32}; [{mem}] = {m32}\n')
+    elif hd_addr == 0x40ef42: # ADD BYTE PTR [MEM], OP
+        dis.write(loc+f'{mnem} [{mem}], {op8}; [{mem}] = {m8}\n')
+    elif hd_addr == 0x40ef6c: # ADD WORD PTR [MEM], OP
+        dis.write(loc+f'{mnem} [{mem}], {op16}; [{mem}] = {m16}\n')
+    elif hd_addr == 0x40ef9a: # ADD DWORD PTR [MEM], OP
+        dis.write(loc+f'{mnem} [{mem}], {op32}; [{mem}] = {m32}\n')
+    elif hd_addr == 0x40efc6: # ROL BYTE PTR [MEM], OP
+        dis.write(loc+f'{mnem} [{mem}],0x{int(op8) & 7}; [{mem}] = {m8}\n')
+    elif hd_addr == 0x40effd: # ROL WORD PTR [MEM], OP
+        dis.write(loc+f'{mnem} [{mem}],0x{int(op8) & 0xF}; [{mem}] = {m16}\n')
+    elif hd_addr == 0x40f038: # ROL DWORD PTR [MEM], OP
+        dis.write(loc+f'{mnem} [{mem}],0x{int(op8) & 0x1F}; [{mem}] = {m32}\n')
+    elif hd_addr == 0x40f070: # ROR BYTE PTR [MEM]
+        dis.write(loc+f'{mnem} [{mem}],0x{int(op8) & 7}; [{mem}] = {m8}\n')
+    elif hd_addr == 0x40f0a7: # ROR WORD PTR [MEM]
+        dis.write(loc+f'{mnem} [{mem}],0x{int(op8) & 0xF}; [{mem}] = {m16}\n')
+    elif hd_addr == 0x40f0e2: # ROR DWORD PTR [MEM]
+        dis.write(loc+f'{mnem} [{mem}],0x{int(op8) & 0x1F}; [{mem}] = {m32}\n')
+    elif hd_addr == 0x40f11a: # NOT BYTE PTR [MEM]
+        dis.write(loc+f'{mnem} [{mem}] = {m8}\n')
+    elif hd_addr == 0x40f13e: # NOT WORD PTR [MEM]
+        dis.write(loc+f'{mnem} [{mem}] = {m16}\n')
+    elif hd_addr == 0x40f164: # NOT DWORD PTR [MEM]
+        dis.write(loc+f'{mnem} [{mem}] = {m32}\n')
+    elif hd_addr == 0x40f189: # shuffle mem
+        ctrl = int(op8)
+        slots = [(ctrl >> (2 * i)) & 3 for i in range(4)]
+        dis.write(loc+f'{mnem} ctrl={ctrl:#04x} -> slots {slots}\n')
+    elif hd_addr == 0x40f2e2: # RC4 Decrypt 
+        keylen  = int(op8)                              # vpc[1]
+        datalen = int(read_value_n(vip + ExprInt(2, 32), 8))   # vpc[2]
+        key = bytes(int(read_value_n(vip + ExprInt(3 + i, 32), 8)) for i in range(keylen))
+        enc_mem = bytes(int(read_value_n(mem + ExprInt(i, 32), 8)) for i in range(datalen))
+        dis.write(loc+ f'{mnem} [{mem}];\t key={key.hex()}\tenc_mem={enc_mem.hex()}\n')
+    elif hd_addr == 0x40f1e2: # MOV BYTE FLAG
+        dis.write(loc+f'{mnem}, {op8}\n')
+    elif hd_addr == 0x40f208: # MOV WORD FLAG
+        dis.write(loc+f'{mnem}, {op16}\n')
+    elif hd_addr == 0x40f230: # MOV DWORD FLAG
+        dis.write(loc+f'{mnem}, {op32}\n')
+    elif hd_addr == 0x40f257: # ADD WORD MEM
+        dis.write(loc+f'{mnem}, {op16}\n')
+    elif hd_addr == 0x40f27f:                       # JNZ byte disp
+        disp   = int(read_value_n(vip + ExprInt(1, 32), 8))
+        jaddr = int(vip) + 2 - disp
+        dis.write(loc+f'{mnem} 0x{jaddr:02X}; zf={read_value_n(flag)}\n')
+    elif hd_addr == 0x40f2af: # JNZ
+        disp   = int(read_value_n(vip + ExprInt(1, 32), 16))
+        jaddr = int(vip) + 3 - disp
+        dis.write(loc+f'{mnem} 0x{jaddr:02X}; zf={read_value_n(flag)}\n')
+    elif hd_addr == 0x40f348: # MOV BYTE REG
+        i = int((int(op8) & 0xF))
+        dis.write(loc+f'{mnem}[0x{i:0X}],0x{int(imm8):0X}\n')
+    elif hd_addr == 0x40f379: # MOV WORD REG
+        i = int((int(op8) & 0xF))
+        dis.write(loc+f'{mnem}[0x{i:0X}],0x{int(op16):0X}\n')
+    elif hd_addr == 0x40f3a7: # MOV DWORD REG
+        i = int((int(op8) & 0xF))
+        dis.write(loc+f'{mnem}[0x{i:0X}],0x{int(imm32):0X}\n')
+    elif hd_addr == 0x40f3d4:
+        i = int((int(op8) & 0xF)); j = int((int(op8) >> 4))
+        dis.write(loc+f'{mnem}[0x{i:0X}], REG[0x{j:0X}]\n')
+    elif hd_addr == 0x40f409:
+        i = int((int(op8) & 0xF)); j = int((int(op8) >> 4))
+        dis.write(loc+f'{mnem}[0x{i:0X}], REG[0x{j:0X}]\n')
+    elif hd_addr == 0x40f43e:
+        i = int((int(op8) & 0xF)); j = int((int(op8) >> 4))
+        dis.write(loc+f'{mnem}[0x{i:0X}], REG[0x{j:0X}]\n')
+    elif hd_addr == 0x40f472:
+        i = int((int(op8) & 0xF)); j = int((int(op8) >> 4))
+        dis.write(loc+f'{mnem}[0x{i:0X}], REG[0x{j:0X}]\n')
+    elif hd_addr == 0x40f4a9:
+        i = int((int(op8) & 0xF)); j = int((int(op8) >> 4))
+        dis.write(loc+f'{mnem}[0x{i:0X}], REG[0x{j:0X}]\n')
+    elif hd_addr == 0x40f4e0:
+        i = int((int(op8) & 0xF)); j = int((int(op8) >> 4))
+        dis.write(loc+f'{mnem}[0x{i:0X}], REG[0x{j:0X}]\n')
+    elif hd_addr == 0x40f5a8:
+        i = int((int(op8) & 0xF)); j = int((int(op8) >> 4))
+        dis.write(loc+f'{mnem}[0x{i:0X}], REG[0x{j:0X}]\n')
+    elif hd_addr == 0x40f5df:
+        i = int((int(op8) & 0xF)); j = int((int(op8) >> 4))
+        dis.write(loc+f'{mnem}[0x{i:0X}], REG[0x{j:0X}]\n')
+    elif hd_addr == 0x40f616:
+        i = int((int(op8) & 0xF)); j = int((int(op8) >> 4))
+        dis.write(loc+f'{mnem}[0x{i:0X}], REG[0x{j:0X}]\n')
+    elif hd_addr == 0x40f6de:
+        i = int((int(op8) & 0xF)); j = int((int(op8) >> 4))
+        dis.write(loc+f'{mnem}[0x{i:0X}], REG[0x{j:0X}]\n')
+    elif hd_addr == 0x40f715:
+        i = int((int(op8) & 0xF)); j = int((int(op8) >> 4))
+        dis.write(loc+f'{mnem}[0x{i:0X}], REG[0x{j:0X}]\n')
+    elif hd_addr == 0x40f74c:
+        i = int((int(op8) & 0xF)); j = int((int(op8) >> 4))
+        dis.write(loc+f'{mnem}[0x{i:0X}], REG[0x{j:0X}]\n')
+    elif hd_addr == 0x40f516:
+        i = int(op8) & 0xf
+        dis.write(loc+f'{mnem}[0x{i:0X}], {imm8}\n')
+    elif hd_addr == 0x40f549:
+        i = int(op8) & 0xf
+        dis.write(loc+f'{mnem}[0x{i:0X}], {op16}\n')
+    elif hd_addr == 0x40f579:
+        i = int(op8) & 0xf
+        dis.write(loc+f'{mnem}[0x{i:0X}], {imm32}\n')
+    elif hd_addr == 0x40f64c:
+        i = int(op8) & 0xf
+        dis.write(loc+f'{mnem}[0x{i:0X}], {imm8}\n')
+    elif hd_addr == 0x40f67f:
+        i = int(op8) & 0xf
+        dis.write(loc+f'{mnem}[0x{i:0X}], {op16}\n')
+    elif hd_addr == 0x40f6af:
+        i = int(op8) & 0xf
+        dis.write(loc+f'{mnem}[0x{i:0X}], {imm32}\n')
+    elif hd_addr == 0x40f782:
+        i = int(op8) & 0xf
+        dis.write(loc+f'{mnem}[0x{i:0X}], {imm8}\n')
+    elif hd_addr == 0x40f7b5:
+        i = int(op8) & 0xf
+        dis.write(loc+f'{mnem}[0x{i:0X}], {op16}\n')
+    elif hd_addr == 0x40f7e5:
+        i = int(op8) & 0xf
+        dis.write(loc+f'{mnem}[0x{i:0X}], {imm32}\n')
+    elif hd_addr == 0x40f946: # this
+        i = int((int(op8) & 0xF)); 
+        dis.write(loc+f'{mnem} [{mem}], REG[0x{i:0X}]; [{mem}] = {m8}\n')
+    elif hd_addr == 0x40f97c:
+        i = int(op8) & 0xf
+        dis.write(loc+f'{mnem} [{mem}], REG[0x{i:0X}]; [{mem}] = {m16}\n')
+    elif hd_addr == 0x40f9b5:
+        i = int((int(op8) & 0xF)); 
+        dis.write(loc+f'{mnem} [{mem}], REG[0x{i:0X}]; [{mem}] = {m32}\n')
+    elif hd_addr == 0x40f9ec:
+        i = int((int(op8) & 0xF)); 
+        dis.write(loc+f'{mnem} [{mem}], REG[0x{i:0X}]; [{mem}] = {m8}\n')
+    elif hd_addr == 0x40fa22:
+        i = int(op8) & 0xf
+        dis.write(loc+f'{mnem} [{mem}], REG[0x{i:0X}]; [{mem}] = {m16}\n')
+    elif hd_addr == 0x40fa5b:
+        i = int(op8) & 0xf
+        dis.write(loc+f'{mnem} [{mem}], REG[0x{i:0X}]; [{mem}] = {m32}\n')
+    elif hd_addr == 0x40fa92:
+        i = int(op8) & 0xf
+        dis.write(loc+f'{mnem} [{mem}], REG[0x{i:0X}]; [{mem}] = {m8}\n')
+    elif hd_addr == 0x40fac8:
+        i = int(op8) & 0xf
+        dis.write(loc+f'{mnem} [{mem}], REG[0x{i:0X}]; [{mem}] = {m16}\n')
+    elif hd_addr == 0x40fb01:
+        i = int(op8) & 0xf
+        dis.write(loc+f'{mnem} [{mem}], REG[0x{i:0X}]; [{mem}] = {m32}\n')
+    elif hd_addr == 0x40f814:
+        i = int(op8) & 0xf
+        dis.write(loc+f'{mnem}[0x{i:0X}], [{mem}] ; {m8}\n')
+    elif hd_addr == 0x40f845:
+        i = int(op8) & 0xf
+        dis.write(loc+f'{mnem}[0x{i:0X}], [{mem}] ; {m16}\n')
+    elif hd_addr == 0x40f876:
+        i = int(op8) & 0xf
+        dis.write(loc+f'{mnem}[0x{i:0X}], [{mem}] ; {m32}\n')
+    elif hd_addr == 0x40f8a6:
+        i = int(op8) & 0xf
+        dis.write(loc+f'{mnem}  [{mem}], REG[0x{i:0X}]; [{mem}] = {m8}\n')
+    elif hd_addr == 0x40f8da:
+        i = int(op8) & 0xf
+        dis.write(loc+f'{mnem}  [{mem}], REG[0x{i:0X}]; [{mem}] = {m8}\n')
+    elif hd_addr == 0x40f911:
+        i = int((int(op8) & 0xF))
+        dis.write(loc+f'{mnem}  [{mem}], REG[0x{i:0X}]; [{mem}] = {m8}\n')
+    elif hd_addr == 0x40ee37:
+        dis.write(loc+f'{mnem}\n')
+    return
+
+write_address(VM_CTX + VIP,  BYTECODE); write_address(VM_CTX + MEM,  MEMCODE); write_address(VM_CTX + FLAG, 0)
+
+for i in range(16):
+    write_address(VM_CTX + REG + i * 4, 0, size=32)
+
+# populating the bytecode addr
+data = container.bin_stream.getbytes(BYTECODE, 0x1000)
+for i, b in enumerate(data):
+    sb.symbols[ExprMem(ExprInt(BYTECODE + i, 32), 8)] = ExprInt(b, 8)
+
+# populating the memcode addr
+data = container.bin_stream.getbytes(MEMCODE, 0x288)
+for i, b in enumerate(data):
+    sb.symbols[ExprMem(ExprInt(MEMCODE + i, 32), 8)] = ExprInt(b, 8)
+
+sb.symbols[ExprMem(ExprInt(STACK_TOP - 4, 32), 32)] = ExprInt(RETN, 32)
+
+HALT = False
+while not HALT: # vm dispatcher
+    idx = int(read_value_n(ctx(VIP))) # reads Virtual Instruction pointer and derefrence 8 bits (1st byte which is at the start of symbolic execution engine) 
+    disassemble(idx)
+    handler_addr = HANDLERS[idx][0]
+    ircfg = lifted(handler_addr)
+    if handler_addr == 0x40EE37: HALT = True # halt handler
+    sb.symbols[lifter.arch.regs.ECX] = ExprInt(VM_CTX, 32)
+    sb.symbols[lifter.arch.regs.ESP] = ExprInt(STACK_TOP - 4, 32)
+    q = deque([ExprInt(handler_addr, 32)]) # adding the handler to be executed
+    symbolic_execution(q, ircfg)
+
+
+dis.close() # closing the disassembly file log
+
+data = bytearray()
+for i in range(0x288):
+    v = read_value_n(ExprInt(MEMCODE + i, 32), 8)
+    data.append(int(v))
+open('mem_dec.bin', 'wb').write(data) # http://rxfkxmtqxg.com/ppcrzaezqs/cfg.bin -- zeus C2 config download URL 
+
+
+```
+
+## Slow Tempest 
