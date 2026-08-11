@@ -1449,7 +1449,9 @@ _After Equivalence checking_
 
 ## Zeus VM Devirtualization 
 
-I picked that sample because its famous and well know. I will cover its string deobfuscation and write a functional disassembler which yields some usefull information. 
+I picked this [sample](https://miasm.re/blog/_downloads/ff528fcfb4cb81b788de4e147d4aba09dd7cda472b7825aae9222330b9790ba9.zip) because it was used in [miasm blog](https://miasm.re/blog/2016/09/03/zeusvm_analysis.html) in 2016. But that post uses old depreciated miasm2 API and also that is more focused on recovery of handler semantics via symbolic execution and getting result of each handler in miasm IR instead of a de-virtualizer.
+
+We will cover its string deobfuscation and write a functional disassembler which yields some usefull information. Which is compelete different approach from that blog  :)
 
 ### String Decryption
 
@@ -1728,7 +1730,7 @@ for i, b in enumerate(data):
 
 ```
 
-> The reason why we initialize this at a byte granulity because miasm will read the dword/word or any reference automatically as long each address should have concerete byte value, also we didn't use the tigress CFF method of concerete values because  we will use only one Symbolic execution engine through out. If we had multiple symbolic execution engines this would fail. 
+> The reason why we initialize this at a byte granularity because miasm will read the dword/word or any reference automatically as long each address should have concerete byte value, also we didn't use the tigress CFF method of concerete values because  we will use only one Symbolic execution engine through out. If we had multiple symbolic execution engines this would fail. 
 {:.prompt-tip}
 
 While analysis of handlers to understand some semantics of handlers so we can write a disassembler. All the handlers are simple/simmilar enough, one handler was a little of so lets see that that is.
@@ -2378,4 +2380,133 @@ open('mem_dec.bin', 'wb').write(data) # http://rxfkxmtqxg.com/ppcrzaezqs/cfg.bin
 
 ```
 
-## Slow Tempest 
+## Slow Tempest Campaign 
+
+`Slow Tempest` is a covert cyber espionage campaign that first emerged in 2024, primarily targeting organizations and Chinese-speaking users in East Asia. The threat actors are known for [advanced persistent threats](https://en.wikipedia.org/wiki/Advanced_persistent_threat)
+
+The sample we are deobfuscating can be downloaded [here](https://malshare.com/sample.php?action=detail&hash=5a8ddc779dcf124fe5692d15be44346fb6d742322acb0eb3c6b4e90f581c5f9e)
+
+It has Multiple Layers of Obfuscations:
+1. Indirect Jump Obfuscation
+3. Indirect Call Obfuscation
+2. Control Flow Flattening
+
+<video src="/assets/posts/2026-08-08-taming-obfuscation/slow_tempest1.webm" controls style="max-width: 100%; height: auto;"></video>
+
+## Indirest Jump Obfuscation
+
+There are many indirect jumps in the whole binary. To check the exact indirect jump i wrote a simple ida script
+
+```py
+import idc 
+
+ea = 0x140001000 # start of text section 
+ind = [] 
+while ea < 0x140057495: # end of text section 
+    if idc.print_insn_mnem(ea) == 'jmp' and idc.get_operand_type(ea, 0) is idc.o_reg: # jmp reg 
+        print(hex(ea)); ind.append(ea) 
+    ea = idc.next_head(ea) 
+print('indirect jmps: ', len(ind)) 
+```
+
+```shell
+indirect jmps:  2788 
+```
+thats alot, so lets see how we can deobfuscate it.
+
+![](2026-08-11-23-04-36.png)
+_conditional indirect jumps_
+
+We see a very similar pattern here, before indirect jump we do have cmovcc and set instruction, which is deciding either a value can be moved to the register or not which effects the control flow. As i saw in many indirect jump blocks the pattern is consistent accross majority. Hence we can pattern match the basic blocks which have indirect jumps and extract the information that what is the cmovcc or set instruction is on which register. Then we can perform symbolic execution two times on the block one with cmovcc/set true and the other with false. Hence we will have both final address inform of jcc and fall, and we can just replace the cmovcc with the jcc instruction proceeding with the fall instruction.
+
+First we will create a class to store all our pattern matching info
+
+```py
+
+class ConditionalJump:
+    def __init__(self, jtype=None, before_cond=None, cond_addr=None, after_cond=None, condition=None, regs=None,trueTarget=None,falseTarget=None,jmpAddr=False):
+        self.jtype = jtype  # set/cmovcc
+        self.before_cond = before_cond # block start
+        self.cond_addr = cond_addr  # cmovcc/set address
+        self.after_cond = after_cond # next address after cmovcc
+        self.condition = condition # cc (condition from cmovcc)
+        self.regs = regs  # src, dst (from cmovcc)
+        self.trueTarget = trueTarget 
+        self.falseTarget = falseTarget      
+        self.jmpAddr = jmpAddr # indirect jmp address
+
+class Jump:
+    def __init__(self, start_addr=None,jmpAddr=False):
+        self.start_addr = start_addr
+        self.jmpAddr = jmpAddr
+```
+
+
+```py
+from capstone import *
+
+
+md = Cs(CS_ARCH_X86, CS_MODE_64)
+md.detail = True
+jumps = []
+disassembly = {}
+
+prevSize = None
+for insn in md.disasm(textData, textVA):
+    if insn.mnemonic == "jmp" and insn.operands[0].type == X86_OP_REG:
+        jumps.append(insn.address)
+    disassembly[insn.address] = [insn.mnemonic,insn.op_str,insn.size,prevSize]
+    prevSize = insn.size
+
+jumpsInfo = []
+for jump in jumps:
+    n = getStartJump(jump)
+    if n != None:
+        jumpsInfo.append(n)
+
+
+def getStartJump(addr):
+    jumpAddress = addr
+    _, _,_, prevSize = disassembly[addr]
+    prevAddr = addr
+    if prevSize == None: return None
+    addr -= prevSize # address of the previous instruciton
+    condAddr = None
+    condition = ""
+    regs = None
+    type = None
+    while addr in disassembly:
+        mnemonic, op_str, size, prevSize = disassembly[addr]
+        # the instructions that split the miasm IR block
+        if mnemonic in ["call","jmp","ret","int3","div,","idiv"] or mnemonic.startswith("j") or (mnemonic == "sub" and "rsp" in op_str):
+            if type != None: #cmov
+                if type == 'cmovcc':
+                    return ConditionalJump(jtype='cmovcc',before_cond=prevAddr,cond_addr=condAddr,after_cond=afterAddr,condition=condition,regs=regs,jmpAddr=jumpAddress)
+
+                elif type == 'setcc':
+                    return ConditionalJump(jtype='setcc',before_cond=prevAddr,cond_addr=condAddr,after_cond=afterAddr,condition=condition,regs=regs,jmpAddr=jumpAddress)
+            else:
+
+                return Jump(start_addr=prevAddr,jmpAddr=jumpAddress) 
+                            # miasm block start addr, jmp instruction addr  
+        elif mnemonic.startswith("cmov") and type == None:
+            type = 'cmovcc'
+            condAddr = addr
+            afterAddr = addr+size
+            reg1,reg2 = op_str.replace(" ","").split(",")
+            regs = [reg_map[reg1.lower()],reg_map[reg2.lower()]] #convert to the 64 bit reg
+            condition = mnemonic[4:]
+        elif mnemonic.startswith("set") and type == None:
+            type = 'setcc'
+            condAddr = addr
+            afterAddr = addr+size
+            condition = mnemonic[3:]
+            regs = reg_map[op_str.lower()]
+        prevAddr = addr
+        if prevSize == None: return None
+        addr -= prevSize 
+    return None
+
+
+
+```
