@@ -2864,7 +2864,7 @@ for addr in funcs: # all the functions we got from IDA (except the library funcs
         print(f"flattening score {flattening_score} for function {hex(addr)}") 
         flat.append(addr) 
 
-print(flat) # all the flattened functions.
+print(flat) # all the flattened functions. 
 
 ```
 
