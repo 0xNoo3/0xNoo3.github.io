@@ -2384,12 +2384,13 @@ open('mem_dec.bin', 'wb').write(data) # http://rxfkxmtqxg.com/ppcrzaezqs/cfg.bin
 
 `Slow Tempest` is a covert cyber espionage campaign that first emerged in 2024, primarily targeting organizations and Chinese-speaking users in East Asia. The threat actors are known for [advanced persistent threats](https://en.wikipedia.org/wiki/Advanced_persistent_threat)
 
-The sample we are deobfuscating can be downloaded [here](https://malshare.com/sample.php?action=detail&hash=5a8ddc779dcf124fe5692d15be44346fb6d742322acb0eb3c6b4e90f581c5f9e)
+The sample we are deobfuscating can be downloaded [here](https://malshare.com/sample.php?action=detail&hash=5a8ddc779dcf124fe5692d15be44346fb6d742322acb0eb3c6b4e90f581c5f9e) 
 
 It has Multiple Layers of Obfuscations:
-1. Indirect Jump Obfuscation
-3. Indirect Call Obfuscation
-2. Control Flow Flattening
+
+1. [Indirect Jump Obfuscation](https://0xnoo3.github.io/posts/taming-obfuscation/#indirest-jump-obfuscation) 
+3. Indirect Call Obfuscation 
+2. [Control Flow Flattening](https://0xnoo3.github.io/posts/taming-obfuscation/#control-flow-flattening)
 
 <video src="/assets/posts/2026-08-08-taming-obfuscation/slow_tempest1.webm" controls style="max-width: 100%; height: auto;"></video>
 
@@ -2417,7 +2418,7 @@ thats alot, so lets see how we can deobfuscate it.
 ![](2026-08-11-23-04-36.png)
 _conditional indirect jumps_
 
-We see a very similar pattern here, before indirect jump we do have cmovcc and set instruction, which is deciding either a value can be moved to the register or not which effects the control flow. As i saw in many indirect jump blocks the pattern is consistent accross majority. Hence we can pattern match the basic blocks which have indirect jumps and extract the information that what is the cmovcc or set instruction is on which register. Then we can perform symbolic execution two times on the block one with cmovcc/set true and the other with false. Hence we will have both final address inform of jcc and fall, and we can just replace the cmovcc with the jcc instruction proceeding with the fall instruction.
+We see a very similar pattern here, before indirect jump we do have cmovcc and set instruction, which is deciding either a value can be moved to the register or not which effects the control flow. As i saw in many indirect jump blocks the pattern is consistent accross majority. Hence we can pattern match the basic blocks which have indirect jumps and extract the information that what is the cmovcc or set instruction is on which register. Then we can perform symbolic execution two times on the block one with cmovcc/set true and the other with false. Hence we will have both final address inform of jcc and fall, and we can just replace the cmovcc with the jcc instruction proceeding with the fall instruction. We also see global data reads in the calculation of indirect jumps so we will set the .data section as concerete value so symbolic execution evaluates jump addresses.
 
 First we will create a class to store all our pattern matching info
 
@@ -2445,6 +2446,7 @@ class Jump:
 ```py
 from capstone import *
 
+[...]
 
 md = Cs(CS_ARCH_X86, CS_MODE_64)
 md.detail = True
@@ -2486,7 +2488,6 @@ def getStartJump(addr):
                 elif type == 'setcc':
                     return ConditionalJump(jtype='setcc',before_cond=prevAddr,cond_addr=condAddr,after_cond=afterAddr,condition=condition,regs=regs,jmpAddr=jumpAddress)
             else:
-
                 return Jump(start_addr=prevAddr,jmpAddr=jumpAddress) 
                             # miasm block start addr, jmp instruction addr  
         elif mnemonic.startswith("cmov") and type == None:
@@ -2507,6 +2508,366 @@ def getStartJump(addr):
         addr -= prevSize 
     return None
 
-
+[...]
 
 ```
+
+By this we have complete info of each conditional and unconditional jump. Now we can perform symbolic execution till the condition and then pause, and then continue with true and false value and hence we will have jcc and jmp, then we can patch them starting from the cmovcc 
+
+```py 
+for jump in jumpsInfo: # iterate through each function 
+    if isinstance(jump,ConditionalJump): # if its a conditional indirect jmp 
+        if jump.jtype == 'cmovcc': #type = cmov          # before_cond=block start 
+            symbols,falseVal,trueVal = symbolic_execution(jump.before_cond,cmovRegs=jump.regs, cond_addr=jump.cond_addr) 
+            # copying the symbols so both can be used seprately on true false condition 
+            symbolsFalse = symbols.copy(); symbolsTrue = symbols.copy() 
+            symbolsFalse[ExprId(jump.regs[1],64)] = falseVal 
+            symbolsTrue[ExprId(jump.regs[0],64)] = trueVal 
+            # symbolic execution if cmovcc is true 
+            trueTarget = symbolic_execution(jump.after_cond,symbols=symbolsTrue,initSymbols=False) 
+            # symbolic execution if cmovcc is false 
+            falseTarget = symbolic_execution(jump.after_cond,symbols=symbolsFalse,initSymbols=False)
+        elif jump.jtype == 'setcc':
+            reg = jump.regs
+            symbols = symbolic_execution(jump.before_cond,cond_addr=jump.cond_addr)
+            symbolsFalse = symbols.copy(); symbolsTrue = symbols.copy()
+            symbolsTrue[ExprId(reg,64)] = ExprInt(1,64) # setcc is true 
+            symbolsFalse[ExprId(reg,64)] = ExprInt(0,64) # setcc is false 
+            # symbolic exection on both set and unset to see what is the jcc and fall
+            falseTarget = symbolic_execution(jump.after_cond,symbols=symbolsFalse, initSymbols=False)
+            trueTarget = symbolic_execution(jump.after_cond,symbols=symbolsTrue, initSymbols=False)
+
+        jump.trueTarget = int(trueTarget); jump.falseTarget = int(falseTarget) 
+
+        patchData = assembleJump(jump.trueTarget,jump.cond_addr,cond=jump.condition)
+        patchData += assembleJump(jump.falseTarget,jump.cond_addr+6)
+
+        patchSize = jump.jmpAddr+2-jump.cond_addr
+        patchData = patchData + ((patchSize - len(patchData)) * b"\x90")
+        patch(jump.cond_addr,patchData)
+        print(hex(jump.jmpAddr), trueTarget, falseTarget)
+    else:
+        r = symbolic_execution(jump.start_addr) # its a unconditional indirect jmp 
+        if not isinstance(r,ExprInt): #false positive OR a missed conditional jmp 
+            print('unconditional jmp missed ExprInt: ', r,hex(jump.start_addr)) 
+            continue 
+        else:
+            print(f"patch unconditional indirect jmp {hex(jump.jmpAddr)}, {r}")
+```
+
+Running the deobfuscator.
+
+![](2026-08-12-01-51-49.png)
+
+> This number matches by the idapython script we wrote. It successfully deobfuscated all 2788 indirect jumps.
+
+<video src="/assets/posts/2026-08-08-taming-obfuscation/ind_j_deob.webm" controls style="max-width: 100%; height: auto;"></video>
+
+
+## Control Flow Flattening
+
+
+![](2026-08-12-02-07-55.png)
+_Flattening CFG_
+ 
+This is very classic example of control flow flattening. Which is much different than the [Tigress CFF](https://0xnoo3.github.io/posts/taming-obfuscation/#tigress-cff) we dealt with. This flattening is without the jump table, hence our will be a bit different here, as we don't have entries of original basic blocks from the jump table. we have the identify the original basic blocks via the CFG design.
+
+> Dispatcher
+
+![](2026-08-12-02-21-23.png)
+_state value read in the first instruction of dispatcher_
+
+> Original Basic Blocks 
+
+![](2026-08-12-02-22-46.png)
+_predecessors of the pre-dispatchers are original basic blocks_
+
+> State update process 
+
+![](2026-08-12-02-25-25.png)
+_direct state update_
+
+Blocks like these just update the state (unconditionally), These are trivial as we can just build the mapping `state to state mapping` and `state to address mapping` but there is a catch 🙂
+
+![](2026-08-12-02-28-12.png)
+_conditional state update_
+
+We can see that cmovcc is followed by a cmp is deciding the state value, so a state can determine more than two next states at two distinct time. So now we will perform symbolic execution on the CFG and build the mapping and then remove the basic block which are not original basic blocks.
+
+> Identify Original Basic Blocks 
+
+```py
+def findOBB(pre_disp_addr):
+    OBB = []
+    pre_disp_loc = loc_db.get_offset_location(pre_disp_addr)
+    # for original basic blocks 
+    for curr_loc in asmcfg.predecessors(pre_disp_loc):
+        pre_obb_loc = asmcfg.predecessors(curr_loc); OBB.append(curr_loc)
+        assert len(pre_obb_loc) == 1
+        while True:
+            pre_obb_block = asmcfg.loc_key_to_block(pre_obb_loc[0])
+            if pre_obb_block.lines[-1].name.startswith('J'): # if its a Jmp/Jcc break
+                break
+            curr_loc = pre_obb_loc[0]
+            pre_obb_loc = asmcfg.predecessors(curr_loc)
+            assert len(pre_obb_loc) == 1
+            OBB.append(curr_loc) # untill then all are original basic block (they are just split because of call)
+
+    # for ret basic blocs/tail calls 
+    for bb in asmcfg.blocks:
+        ret_loc = bb.loc_key
+        if len(asmcfg.successors(ret_loc)) == 0: # same algo just on the return as it has no successors
+            ret_pre_loc = asmcfg.predecessors(ret_loc); OBB.append(ret_loc)
+            assert len(ret_pre_loc) == 1
+            while True:
+                ret_pre_block = asmcfg.loc_key_to_block(ret_pre_loc[0])
+                if ret_pre_block.lines[-1].name.startswith('J'):
+                    break
+                ret_loc = ret_pre_loc[0]
+                ret_pre_loc = asmcfg.predecessors(ret_loc)
+                assert len(ret_pre_loc) == 1
+                OBB.append(ret_loc)
+            print('RET: ', hex(loc_db.get_location_offset(ret_loc)))
+
+    return OBB
+```
+
+We will perform symbolic execution on the CFG in [BFS](https://en.wikipedia.org/wiki/Breadth-first_search) manner. execute the block, append the false condition in the queue for later execution, go with the true value, when the address is one of original basic block update the `state to address map` and when the address reaches the pre-dispatcher we update `state to state map` just before symbolic execution on each basic blocks, we will scan for cmp followed by cmovcc, if they are found it means that we are dealing with jcc states. and return a condition (so it can be separated as true and false branch) else we return solid brancing address.
+
+```py
+q = deque([(loc_db.get_offset_location(addr), first_state_val, init_symbols)]); visited_location = set() 
+
+while q:
+    curr_addr_loc, curr_state_val, symbols = q.popleft()
+    sb = SymbolicExecutionEngine(lifter, symbols, sb_expr_simp=custom_simp)
+
+    while True:
+        r = symbolic_execution(sb, curr_addr_loc) 
+        if r is None: break 
+
+        if r.is_cond():
+            cond_true = {r.cond: ExprInt(1, 32)}; cond_false = {r.cond: ExprInt(0, 32)} 
+            jt = to_loc_key(expr_simp(sb.eval_expr(r.replace_expr(cond_true), {}))) 
+            jf = to_loc_key(expr_simp(sb.eval_expr(r.replace_expr(cond_false), {}))) 
+            q.append((jf, curr_state_val, sb.symbols.copy())) # append the false branch for later symbolic execution 
+            curr_addr_loc = jt
+        else:
+            curr_addr_loc = to_loc_key(expr_simp(sb.eval_expr(r))) # curr_addr_loc = next_loc 
+
+        if curr_addr_loc in visited_location: break 
+
+        elif curr_addr_loc in OBB:
+            visited_location.add(curr_addr_loc)
+            curr_state_val = int(sb.eval_expr(state_variable))
+            # check if the current address is already added in the correspinding state list
+            if curr_addr_loc not in state_to_addr_map[curr_state_val]: 
+                state_to_addr_map[curr_state_val].append(curr_addr_loc)
+
+            if first_state_val is None: first_state_val = curr_state_val 
+
+        elif curr_addr_loc == pre_disp_loc:
+            nState_val = int(sb.eval_expr(state_variable))
+
+            if nState_val not in state_to_state_map[curr_state_val]:
+                state_to_state_map[curr_state_val].append(nState_val)
+            curr_state_val = None
+
+def symbolic_execution(sb, address_loc):
+
+    cmp_ins = None; cmovcc_ins = None
+    current_asm_block = asmcfg.loc_key_to_block(address_loc)
+    if current_asm_block is None: return sb.run_block_at(ircfg=ircfg, addr=address_loc)
+    for ins in current_asm_block.lines:
+        if ins.name in ['CMP', 'TEST']:
+            cmp_ins = ins
+        elif ins.name.startswith('CMOV'):
+            cmovcc_ins = ins
+            break
+
+    if current_asm_block.lines[-1].name == 'CALL':
+        rsp = sb.symbols[lifter.arch.regs.RSP]; rbp = sb.symbols[lifter.arch.regs.RBP]
+        r = sb.run_block_at(ircfg=ircfg, addr=address_loc)
+        sb.symbols[lifter.arch.regs.RSP] = rsp; sb.symbols[lifter.arch.regs.RBP] = rbp
+        return r 
+
+    if cmovcc_ins is not None and cmp_ins is not None:
+        curr_loc = address_loc
+        # print(current_asm_block)
+        sb.run_block_at(ircfg=ircfg, addr=curr_loc)
+        while True:
+            current_ir_block = ircfg.get_block(addr=curr_loc)
+            # print('check', hex(loc_db.get_location_offset(address_loc))) # debug 
+            for ir_ins in current_ir_block:
+                if ir_ins.instr.name.startswith('CMOV'):
+                    cmov_cond_expr = ir_ins.values()[-1]
+                    if str(cmovcc_ins).startswith('CMOVN'):print(ir_ins.instr.name,' ', hex(loc_db.get_location_offset(to_loc_key(curr_loc))), cmov_cond_expr);\
+                        return cmov_cond_expr.copy()
+                    print(ir_ins.instr.name,' ', hex(loc_db.get_location_offset(to_loc_key(curr_loc))), cmov_cond_expr)
+                    return ExprCond(cmov_cond_expr.cond.copy(), cmov_cond_expr.src2.copy(), cmov_cond_expr.src1.copy()) # flip the condition
+            curr_loc = sb.run_block_at(ircfg=ircfg, addr=curr_loc)
+    else:
+        return sb.run_block_at(ircfg=ircfg, addr=address_loc)
+```
+
+I ran the script after setting the necessary addresses, it threw an error even though i was sure it would work.
+
+```shell
+imagebase:  0x140000000
+RET:  0x140053d73
+STATE:  @64[RSP + 0x50]
+CMOVNZ   0x1400536f4 CC_EQ(zf)?(loc_key_167,loc_key_166)
+CMOVG   0x140053791 CC_S>(nf, of, zf)?(loc_key_175,loc_key_176)
+CMOVZ   0x1400538ca CC_EQ(zf)?(loc_key_170,loc_key_171)
+CMOVA   0x140053993 CC_U>(cf, zf)?(loc_key_186,loc_key_187)
+CMOVNZ   0x140053a88 CC_EQ(zf)?(loc_key_189,loc_key_188)
+CMOVG   0x140053810 CC_S>(nf, of, zf)?(loc_key_184,loc_key_185)
+CMOVNZ   0x140053b00 CC_EQ(zf)?(loc_key_169,loc_key_168)
+Traceback (most recent call last):
+  File "/home/xyz/working/deob/miasm_101/slow/cff_slowtempest.py", line 178, in <module>
+    r = symbolic_execution(sb, curr_addr_loc)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/xyz/working/deob/miasm_101/slow/cff_slowtempest.py", line 144, in symbolic_execution
+    for ir_ins in current_ir_block:
+TypeError: 'NoneType' object is not iterable
+
+```
+
+And i wonder why the irblock is none :/
+
+`print('debug: ', hex(loc_db.get_location_offset(address_loc)))` I added this in symbolic execution function. So i can get which asm block the error occurs.
+
+```shell
+[...]
+debug:  0x1400534d7
+debug:  0x1400534f4
+debug:  0x14005351d
+debug:  0x14005353a
+debug:  0x140053b5f
+Traceback (most recent call last):
+  File "/home/xyz/working/deob/miasm_101/slow/cff_slowtempest.py", line 179, in <module>
+    r = symbolic_execution(sb, curr_addr_loc)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/xyz/working/deob/miasm_101/slow/cff_slowtempest.py", line 145, in symbolic_execution
+    for ir_ins in current_ir_block:
+TypeError: 'NoneType' object is not iterable
+```
+> Block at 0x140053b5f 
+
+![](2026-08-12-03-01-07.png)
+_idiv instruction_
+
+`idiv` instruction creates a split in ircfg due to its exception handling.
+
+```py
+    for ins in current_asm_block.lines:
+        if ins.name == 'IDIV': # just added this in the symb exe 
+            address_loc = ins.offset + ins.l # skipped the idiv instruction execution 
+        elif ins.name in ['CMP', 'TEST']:
+            cmp_ins = ins
+        elif ins.name.startswith('CMOV'):
+            cmovcc_ins = ins
+            break
+```
+
+```shell
+$ python cff_slowtempest.py 
+imagebase:  0x140000000
+RET:  0x140053d73
+STATE:  @64[RSP + 0x50]
+CMOVNZ   0x1400536f4 CC_EQ(zf)?(loc_key_167,loc_key_166)
+CMOVG   0x140053791 CC_S>(nf, of, zf)?(loc_key_175,loc_key_176)
+CMOVZ   0x1400538ca CC_EQ(zf)?(loc_key_170,loc_key_171)
+CMOVA   0x140053993 CC_U>(cf, zf)?(loc_key_186,loc_key_187)
+CMOVNZ   0x140053a88 CC_EQ(zf)?(loc_key_189,loc_key_188)
+CMOVG   0x140053810 CC_S>(nf, of, zf)?(loc_key_184,loc_key_185)
+CMOVNZ   0x140053b00 CC_EQ(zf)?(loc_key_169,loc_key_168)
+CMOVNZ   0x140053ba2 CC_EQ(zf)?(loc_key_183,loc_key_182)
+CMOVL   0x140053c55 CC_S<(nf, of)?(loc_key_177,loc_key_178)
+function prologue 0x140052a70
+Patched: slowtempest.cff_deob.bin
+```
+
+Lets check !!!
+
+![](2026-08-12-03-09-52.png)
+_before_
+
+![](2026-08-12-03-05-42.png)
+_After_
+
+Now we want to deobfuscate the entire binary CFG.
+
+First i will get all the addresses of the functions from ida python.
+
+```py
+import idautils
+import idc
+
+funcs = []
+for ea in idautils.Functions():
+    flags = idc.get_func_flags(ea)
+    if flags & idc.FUNC_LIB:
+        continue  # skip library functions
+    funcs.append(ea)
+```
+
+we got all the function addresses excluding the library functions.
+
+```py
+from miasm.analysis.binary import Container
+from miasm.analysis.machine import Machine
+from miasm.core.locationdb import LocationDB
+
+
+def calc_flattening_score(asm_graph, loc_db):
+    # (c) Tim Blazytko 2021
+    # implementation based on the blog post "Automated Detection of Control-flow Flattening"
+    # https://synthesis.to/2021/03/03/flattening_detection.html
+    # init score
+    score = 0.0
+    # walk over all entry nodes in the graph
+    for head in asm_graph.heads_iter():
+        # compute dominator tree
+        dominator_tree = asm_graph.compute_dominator_tree(head)
+        # walk over all basic blocks
+        for block in asm_graph.blocks:
+            # get location key for basic block via basic block address
+            block_key = loc_db.get_offset_location(block.lines[0].offset)
+            # get all blocks that are dominated by the current block
+            dominated = set(
+                [block_key] + [b for b in dominator_tree.walk_depth_first_forward(block_key)])
+            # check for a back edge
+            if not any([b in dominated for b in asm_graph.predecessors(block_key)]):
+                continue
+            # calculate relation of dominated blocks to the blocks in the graph
+            score = max(score, len(dominated)/len(asm_graph.nodes()))
+    return score
+
+# init symbol table 
+loc_db = LocationDB() 
+
+# open the binary for analysis 
+container = Container.from_stream(open('slowtempest.jmp_deob.bin', 'rb'), loc_db) 
+
+# cpu abstraction 
+machine = Machine(container.arch) 
+
+# init disassemble engine 
+mdis = machine.dis_engine(container.bin_stream, loc_db=loc_db) 
+flat = [] 
+for addr in funcs: # all the functions we got from IDA (except the library funcs) 
+
+    asm_cfg = mdis.dis_multiblock(addr) 
+
+    flattening_score = calc_flattening_score(asm_cfg, loc_db) 
+    if flattening_score > 0.7: # this condition after i noticed that all functions that were below 7 we not obfuscated
+        print(f"flattening score {flattening_score} for function {hex(addr)}") 
+        flat.append(addr) 
+
+print(flat) # all the flattened functions.
+
+```
+
+
+
+
