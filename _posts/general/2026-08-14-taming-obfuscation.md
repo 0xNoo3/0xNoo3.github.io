@@ -1,7 +1,7 @@
 ---
 title: Binary Deobfuscation 101 🐍
 description: Taming real world malware obfuscations
-date: 2026-08-11 
+date: 2026-08-14
 categories: [Deobfuscation]
 media_subpath: /assets/posts/2026-08-08-taming-obfuscation/
 tags: [deobfuscation, symbolic execution, miasm, virtual machine obfuscation, cff, opaque-predicates, indirect jump, indirect calls]
@@ -16,14 +16,12 @@ When it comes to reverse engineering of real world malware samples, we are not p
 ## Who is this post for?
 If you are getting your hands dirty in binary deobfuscation this is for you, as i will go from basic concepts to advance (kind of).
 You can read about [Advance Binrary Deobfuscations](https://github.com/malrev/ABD/blob/master/Advanced-Binary-Deobfuscation.pdf).
-I will discuss the solutions of **ABD** Exercises that I have done from getting started and giving basic overview of miasm
+I will discuss some of the solutions of **ABD** Exercises that I have done and giving basic overview of miasm
 After that we will do deobfuscation of real world malware samples Which included Multiple Obfuscations Such as:
 > Opaque predicates, Virtual Machine Based Obfuscation, Indirect Jumps, Indirect Calls and Control Flow Flattening.
 
-For the basic examples i am using [src](https://github.com/malrev/ABD/tree/master/hands-on1) from ABD
+For some basic examples i will be using [src](https://github.com/malrev/ABD/tree/master/hands-on1) from ABD
 
-> These will be simple dummy examples so you can skip to malware obfuscation if you are well aware of the basics
-{:.prompt-info}
 
 ![](2026-08-08-22-31-24.png)
 
@@ -31,7 +29,7 @@ Because of this fact i cannot pick a single source so the source will be changin
 
 ## Dead Code Removal
 
-Original Source:
+Basic Example Source:
 ```c
 #include <stdio.h>
 
@@ -140,8 +138,6 @@ The full script can be found [here](https://gist.github.com/0xNoo3/c879a676e19d8
 
 In computer programming, an opaque predicate is a predicate, an expression that evaluates to either "true" or "false", for which the outcome is known by the programmer a priori, but which, for a variety of reasons, still needs to be evaluated at run time.
 
-> from wiki
-
 so its just having multiple Basic Blocks that are never executed, Which results in increase number of basic blocks and function sizes are increased. 
 
 ![](2026-08-08-22-13-42.png)
@@ -149,7 +145,7 @@ _Classic Opaque Predicates_
 
 i never thought of deobfuscating hello world lol. We are choosing this example now because it has ollvm bcf.
 
-Source:
+Basic Example Source:
 ```c
 #include <stdio.h>
 
@@ -228,13 +224,93 @@ So in this case we will read 4 bytes (skipping the 2 jcc default bytes) and beca
 
 The Whole script is can be found [here](https://gist.github.com/0xNoo3/c879a676e19d8f2a879f89165424a781#file-02_remove_opaque_predicates-py)
 
+### X-tunnel
+
+Opaque predicates alone are not hard to deal with, i think they are trivial, lets take the example of this apt malware.
+
+![](2026-08-14-04-48-19.png)
+_fully opaque CFG_
+
+![](2026-08-14-04-49-15.png)
+_Opaque Function decompilation_
+
+It's decompilation is more than 4k LOC.
+
+```py
+from miasm.core.locationdb import LocationDB
+from miasm.analysis.binary import Container
+from miasm.analysis.machine import Machine
+from miasm.ir.translators.z3_ir import TranslatorZ3
+from miasm.ir.symbexec import SymbolicExecutionEngine
+from miasm.expression.expression import ExprCond
+import z3
+import lief
+import struct
+
+file = 'x-tunnel.bin'
+addr = 0x424760
+
+p32 = lambda d: struct.pack('<I', d)
+u32 = lambda d, i: struct.unpack('<I', d[i:i+4])[0]
+pe = lief.PE.parse(file); binary = bytearray(open(file, 'rb').read())
+va = lambda addr: pe.va_to_offset(addr)
+
+loc_db = LocationDB()
+container = Container.from_stream(open(file, 'rb'), loc_db=loc_db)
+machine = Machine(container.arch)
+mdis = machine.dis_engine(container.bin_stream, loc_db=loc_db)
+lifter = machine.lifter_model_call(loc_db=loc_db)
+asmcfg = mdis.dis_multiblock(addr)
+ircfg = lifter.new_ircfg_from_asmcfg(asmcfg=asmcfg)
+
+def is_opaque(l, r):
+    s = z3.Solver()
+    t = TranslatorZ3()
+    s.add(t.from_expr(l) == t.from_expr(r))
+    return s.check() == z3.unsat
+
+for bb in asmcfg.blocks:
+    # init sybolic execution 
+    sb = SymbolicExecutionEngine(lifter=lifter)
+    # symbolic execution of bb
+    r = sb.run_block_at(ircfg=ircfg, addr=bb.lines[0].offset) 
+    if not r.is_cond():
+        continue
+    ins = bb.lines[-1]
+    vaddr = ins.offset; offset = va(vaddr)
+    # cond? jump: fall
+    jcc = is_opaque(r, r.src1); fall = is_opaque(r, r.src2)
+    # print('jcc ', jcc, 'fall ', fall)
+    if jcc: # jcc is opaque so it won't jmp
+        # patch the jcc, so it just falls
+
+        binary[offset:offset+ins.l] = b'\x90' * ins.l # nop jcc 
+        print('Patch NOP: ', hex(vaddr), ins.l, hex(offset)) # not hitting in this case 
+
+    elif fall: # fall is opaque so it won't fall 
+        # replace with direct jump 
+        print('Replace jcc', hex(vaddr), ins.l) # debug 
+        # nothing there are no opaque jcc so just left it
+
+
+open(file + '.deob', 'wb').write(binary) # removed opaque predicate, clean deobfuscated patched file
+```
+
+![](2026-08-14-04-52-29.png)
+_After deobfuscation_
+
+Decompiled function LOC is reduced massively 
+
+![](2026-08-14-04-53-06.png)
+_Decompiled Function_
+
 
 ## Stack VM
 
 Its a simple stack VM. This example will is VM Obfuscation with [Tigress](https://tigress.wtf/)
 And by this you will see how a very simple example becomes when VM obfuscation is applied to it.
 
-Source:
+Basic Example Source:
 ```c
 #include <stdio.h>
 
@@ -922,7 +998,7 @@ This example has [Control Flow Flattening](https://tigress.cs.arizona.edu/transf
 Its nothing serious its just [180 LOC](https://gist.github.com/0xNoo3/c879a676e19d8f2a879f89165424a781#file-06_testing_cff-c) and its obfuscated version is [520 LOC](https://gist.github.com/0xNoo3/c879a676e19d8f2a879f89165424a781#file-06_testing_cff-c-L190)
 
 ![](2026-08-09-03-09-19.png)
-_Flattened function CFG 🫠_
+_Flattened function CFG_
 
 ![](2026-08-10-23-15-40.png)
 _Dispatcher_
@@ -2389,12 +2465,23 @@ The sample we are deobfuscating can be downloaded [here](https://malshare.com/sa
 It has Multiple Layers of Obfuscations:
 
 1. [Indirect Jump Obfuscation](https://0xnoo3.github.io/posts/taming-obfuscation/#indirest-jump-obfuscation) 
-3. Indirect Call Obfuscation 
 2. [Control Flow Flattening](https://0xnoo3.github.io/posts/taming-obfuscation/#control-flow-flattening)
+3. [Indirect Call Obfuscation](https://0xnoo3.github.io/posts/taming-obfuscation/#indirect-call-obfuscation)
 
 <video src="/assets/posts/2026-08-08-taming-obfuscation/slow_tempest1.webm" controls style="max-width: 100%; height: auto;"></video>
 
 ## Indirest Jump Obfuscation
+
+![](2026-08-13-21-53-56.png)
+_A very frequent pattern in whole binary_
+
+![](2026-08-13-21-57-31.png)
+_indirect jumps_
+
+Even the function is large enough but the flow is broken due to indirect jumps. 
+
+![](2026-08-13-21-55-12.png)
+_CFG_
 
 There are many indirect jumps in the whole binary. To check the exact indirect jump i wrote a simple ida script
 
@@ -2557,19 +2644,284 @@ for jump in jumpsInfo: # iterate through each function
 
 Running the deobfuscator.
 
+![](2026-08-13-21-55-12.png)
+_before indirect jmp resolution_
+
+![](2026-08-13-22-13-55.png)
+_After indirect jmp resolution_
+
 ![](2026-08-12-01-51-49.png)
 
 > This number matches by the idapython script we wrote. It successfully deobfuscated all 2788 indirect jumps.
 
 <video src="/assets/posts/2026-08-08-taming-obfuscation/ind_j_deob.webm" controls style="max-width: 100%; height: auto;"></video>
 
+The whole indirect jump deobfuscation script
+
+```py
+from miasm.analysis.binary import Container
+from miasm.analysis.machine import Machine
+from miasm.core.locationdb import LocationDB
+from miasm.core.asmblock import AsmCFG
+from miasm.ir.symbexec import SymbolicExecutionEngine
+from miasm.arch.x86.regs import all_regs_ids, all_regs_ids_init
+from miasm.expression.simplifications import ExpressionSimplifier, expr_simp_explicit, expr_simp
+from miasm.expression.expression import ExprVisitorCallbackTopToBottom, ExprMem, ExprInt, ExprId
+from capstone import *
+from capstone.x86 import *
+import struct
+import lief
+
+file = 'slowtempest.bin'
+pe = lief.PE.parse(file)
+image_base = pe.imagebase
+text_section = pe.get_section(".text")
+textData = bytearray(text_section.content)
+textVA = image_base + text_section.virtual_address
+data_section = pe.get_section(".data")
+rawData = bytearray(open(file,'rb').read()) #for the writeback at the end
+
+u64 = lambda d: struct.unpack('<Q', d)[0]
+u32 = lambda d: struct.unpack('<I', d)[0]
+va = lambda addr: pe.va_to_offset(addr)
+
+concreteSymbols = {}
+def add_data(symb, offset, data):
+    for i in range(0,len(data),8):
+        symb[ExprMem(ExprInt(offset + i, 64),64)] = ExprInt(u64(data[i:i+8]), 64)
+    #for the dword references
+    for i in range(0,len(data),4):
+        symb[ExprMem(ExprInt(offset + i, 32),32)] = ExprInt(u32(data[i:i+4]), 32)
+
+def simpExprMemCallBack(expr):
+    if isinstance(expr, ExprMem):
+        if expr in concreteSymbols:
+            newExpr = expr.replace_expr({expr:concreteSymbols[expr]})
+            return newExpr
+    return None
+
+def simpExprMem(_,expr): # https://github.com/cea-sec/miasm/blob/master/miasm/expression/expression.py#L614 
+    visitor = ExprVisitorCallbackTopToBottom(lambda expr:simpExprMemCallBack(expr))
+    return visitor.visit(expr)
+
+def patch(va, data):
+    rva = va - image_base
+    text_rva = text_section.virtual_address
+    offset = rva - text_rva 
+    textData[offset:offset + len(data)] = data
+
+class ConditionalJump:
+    def __init__(self, jtype=None, before_cond=None, cond_addr=None, after_cond=None, condition=None, regs=None,trueTarget=None,falseTarget=None,jmpAddr=False):
+        self.jtype = jtype  # set/cmovcc
+        self.before_cond = before_cond # block start
+        self.cond_addr = cond_addr  # cmovcc/set address
+        self.after_cond = after_cond # next address after cmovcc
+        self.condition = condition # cc (condition from cmovcc)
+        self.regs = regs  # src, dst (from cmovcc)
+        self.trueTarget = trueTarget 
+        self.falseTarget = falseTarget      
+        self.jmpAddr = jmpAddr # indirect jmp address
+
+class Jump:
+    def __init__(self, start_addr=None,jmpAddr=False):
+        self.start_addr = start_addr
+        self.jmpAddr = jmpAddr
+
+add_data(concreteSymbols, data_section.virtual_address + image_base, bytes(data_section.content))
+
+md = Cs(CS_ARCH_X86, CS_MODE_64)
+md.detail = True
+jumps = []
+disassembly = {}
+
+#any spelling of a gpr -> the 64 bit one. the old 4 entry reg_map KeyErrors on 
+#sil/dil/r8b/... and reg.replace("e","r") turns r8d into R8D 
+reg_map = {} 
+for i,r in enumerate(["RAX","RCX","RDX","RBX","RSP","RBP","RSI","RDI","R8","R9","R10","R11","R12","R13","R14","R15"]):
+    if i < 8:
+        l = r[1:].lower() 
+        names = [r, "e"+l, l, (l[0]+"l" if l[1] == "x" else l+"l")] 
+        if l[1] == "x": names.append(l[0]+"h") 
+    else:
+        names = [r, r+"D", r+"W", r+"B"] 
+    for n in names: reg_map[n.lower()] = r 
+
+cond_jump_insts = {'jo': bytearray(b'\x0f\x80'), 'jno': bytearray(b'\x0f\x81'), 'js': bytearray(b'\x0f\x88'), 'jns': bytearray(b'\x0f\x89'), 'je': bytearray(b'\x0f\x84'), 'jz': bytearray(b'\x0f\x84'), 'jne': bytearray(b'\x0f\x85'), 'jnz': bytearray(b'\x0f\x85'), 'jb': bytearray(b'\x0f\x82'), 'jnae': bytearray(b'\x0f\x82'), 'jc': bytearray(b'\x0f\x82'), 'jae': bytearray(b'\x0f\x83'), 'jnb': bytearray(b'\x0f\x83'), 'jnc': bytearray(b'\x0f\x83'), 'jbe': bytearray(b'\x0f\x86'), 'jna': bytearray(b'\x0f\x86'), 'ja': bytearray(b'\x0f\x87'), 'jnbe': bytearray(b'\x0f\x87'), 'jl': bytearray(b'\x0f\x8c'), 'jnge': bytearray(b'\x0f\x8c'), 'jge': bytearray(b'\x0f\x8d'), 'jnl': bytearray(b'\x0f\x8d'), 'jle': bytearray(b'\x0f\x8e'), 'jng': bytearray(b'\x0f\x8e'), 'jg': bytearray(b'\x0f\x8f'), 'jnle': bytearray(b'\x0f\x8f'), 'jp': bytearray(b'\x0f\x8a'), 'jpe': bytearray(b'\x0f\x8a'), 'jnp': bytearray(b'\x0f\x8b'), 'jpo': bytearray(b'\x0f\x8b')}
+
+def assembleJump(target, currentAddr,cond=None):
+    offset = target - currentAddr
+    if offset >= 0 and cond != None: offset = offset - 6
+    if offset >= 0 and cond == None: offset = offset - 5
+    offset = offset.to_bytes(4,'little',signed=True) 
+    inst = b""
+    if cond != None:
+        inst += cond_jump_insts["j"+cond] 
+    else:
+        inst += b"\xE9"
+    return inst + offset 
+
+def getStartJump(addr):
+    jumpAddress = addr
+    _, _,_, prevSize = disassembly[addr]
+    prevAddr = addr
+    if prevSize == None: return None
+    addr -= prevSize # address of the previous instruciton
+    condAddr = None
+    condition = ""
+    regs = None
+    type = None
+    while addr in disassembly:
+        mnemonic, op_str, size, prevSize = disassembly[addr]
+        # the instructions that split the miasm IR block
+        if mnemonic in ["call","jmp","ret","int3","div,","idiv"] or mnemonic.startswith("j") or (mnemonic == "sub" and "rsp" in op_str):
+            if type != None: #cmov
+                if type == 'cmovcc':
+                    return ConditionalJump(jtype='cmovcc',before_cond=prevAddr,cond_addr=condAddr,after_cond=afterAddr,condition=condition,regs=regs,jmpAddr=jumpAddress)
+
+                elif type == 'setcc':
+                    return ConditionalJump(jtype='setcc',before_cond=prevAddr,cond_addr=condAddr,after_cond=afterAddr,condition=condition,regs=regs,jmpAddr=jumpAddress)
+            else:
+
+                return Jump(start_addr=prevAddr,jmpAddr=jumpAddress) 
+                            # miasm block start addr, jmp instruction addr  
+        elif mnemonic.startswith("cmov") and type == None:
+            type = 'cmovcc'
+            condAddr = addr
+            afterAddr = addr+size
+            reg1,reg2 = op_str.replace(" ","").split(",")
+            regs = [reg_map[reg1.lower()],reg_map[reg2.lower()]] #convert to the 64 bit reg
+            condition = mnemonic[4:]
+        elif mnemonic.startswith("set") and type == None:
+            type = 'setcc'
+            condAddr = addr
+            afterAddr = addr+size
+            condition = mnemonic[3:]
+            regs = reg_map[op_str.lower()]
+        prevAddr = addr
+        if prevSize == None: return None
+        addr -= prevSize 
+    return None
+
+prevSize = None
+for insn in md.disasm(textData, textVA):
+    if insn.mnemonic == "jmp" and insn.operands[0].type == X86_OP_REG:
+        jumps.append(insn.address)
+    disassembly[insn.address] = [insn.mnemonic,insn.op_str,insn.size,prevSize]
+    prevSize = insn.size
+
+jumpsInfo = []
+for jump in jumps:
+    n = getStartJump(jump)
+    if n != None:
+        jumpsInfo.append(n)
+
+fdesc = open(file, 'rb')
+loc_db = LocationDB()
+cont = Container.from_stream(fdesc, loc_db)
+machine = Machine(cont.arch)
+mdis = machine.dis_engine(cont.bin_stream, loc_db=cont.loc_db)
+lifter = machine.lifter_model_call(mdis.loc_db)
+
+simplifier = ExpressionSimplifier()
+simplifier.enable_passes(ExpressionSimplifier.PASS_COMMONS)
+simplifier.enable_passes(ExpressionSimplifier.PASS_HIGH_TO_EXPLICIT)
+simplifier.enable_passes({ExprMem:[simpExprMem]})
+
+
+def symbolic_execution(blockAddr, symbols = {}, cond_addr=None, cmovRegs=[]):
+    addr = blockAddr
+    asmcfg = AsmCFG(loc_db)
+    block = mdis.dis_block(addr)
+
+    if cond_addr:
+        while block.lines:
+            last_instr = block.lines[-1]
+            if last_instr.offset == cond_addr: # removing the lines from the block untill cmovcc or setcc
+                block.lines.pop() 
+                break
+            block.lines.pop()
+
+    asmcfg.add_block(block) # building block before cmovcc or setcc
+
+    ircfg = lifter.new_ircfg_from_asmcfg(asmcfg) 
+
+    if symbols == {}: # when the there are no symbols 
+        for i, r in enumerate(all_regs_ids): 
+            symbols[r] = all_regs_ids_init[i]
+ 
+    sb = SymbolicExecutionEngine(lifter,symbols,sb_expr_simp=simplifier) 
+
+    r = sb.run_block_at(ircfg, addr)
+
+    if cmovRegs != []: # false in set condition
+        regs = cmovRegs 
+        false = sb.symbols[ExprId(regs[0],64)] #if dst is not moved to src
+        true = sb.symbols[ExprId(regs[1],64)] #if dst is moved to src
+        assert isinstance(false,ExprInt) and isinstance(true,ExprInt)
+        return sb.symbols.copy(), false, true
+    elif cond_addr:
+        return sb.symbols.copy()
+    else:
+        return r
+
+
+print(f"{file}: base {hex(image_base)}, .text {hex(text_section.virtual_address)}, {len(jumps)} jmp reg")
+bad = {}
+patched = 0
+for jump in jumpsInfo: 
+    if isinstance(jump,ConditionalJump): 
+        if jump.jtype == 'cmovcc': #type = cmov          # before_cond=block start 
+            symbols,falseVal,trueVal = symbolic_execution(jump.before_cond,cmovRegs=jump.regs, cond_addr=jump.cond_addr) 
+            symbolsFalse = symbols.copy(); symbolsTrue = symbols.copy()
+            symbolsFalse[ExprId(jump.regs[1],64)] = falseVal 
+            symbolsTrue[ExprId(jump.regs[0],64)] = trueVal 
+            trueTarget = symbolic_execution(jump.after_cond,symbols=symbolsTrue)
+            falseTarget = symbolic_execution(jump.after_cond,symbols=symbolsFalse)
+            assert isinstance(trueTarget,ExprInt) and isinstance(falseTarget,ExprInt)
+        elif jump.jtype == 'setcc':
+            reg = jump.regs
+            symbols = symbolic_execution(jump.before_cond,cond_addr=jump.cond_addr)
+            symbolsFalse = symbols.copy(); symbolsTrue = symbols.copy()
+            symbolsFalse[ExprId(reg,64)] = ExprInt(0,64)
+            symbolsTrue[ExprId(reg,64)] = ExprInt(1,64)
+            falseTarget = symbolic_execution(jump.after_cond,symbols=symbolsFalse)
+            trueTarget = symbolic_execution(jump.after_cond,symbols=symbolsTrue)
+            assert isinstance(trueTarget,ExprInt) and isinstance(falseTarget,ExprInt)
+
+        jump.trueTarget = int(trueTarget)
+        jump.falseTarget = int(falseTarget)
+
+        patchData = assembleJump(jump.trueTarget,jump.cond_addr,cond=jump.condition)
+        patchData += assembleJump(jump.falseTarget,jump.cond_addr+6)
+
+        patchSize = jump.jmpAddr+2-jump.cond_addr
+        patchData = patchData + ((patchSize - len(patchData)) * b"\x90")
+        patch(jump.cond_addr,patchData)
+        patched += 1
+        print(hex(jump.jmpAddr),trueTarget,falseTarget)
+    else:
+        r = symbolic_execution(jump.start_addr) 
+        if not isinstance(r,ExprInt): #false positive OR a missed conditional jmp   
+            print('unconditional jmp missed ExprInt: ', r,hex(jump.start_addr)) 
+            continue 
+        else:
+            print(f"manually patch tailcall at {hex(jump.jmpAddr)}, {r}")
+
+print(f"patched {patched}/{len([j for j in jumpsInfo if isinstance(j,ConditionalJump)])}")
+
+
+rawData[text_section.pointerto_raw_data:text_section.pointerto_raw_data+len(textData)] = textData
+out = file.split('.bin')[0] + '.jmp_deob.bin'
+open(out,"wb").write(rawData)
+print(f"wrote {out}")
+```
 
 ## Control Flow Flattening
 
 
 ![](2026-08-12-02-07-55.png)
-_Flattening CFG_
- 
+_Flattened CFG 🫠_
+
 This is very classic example of control flow flattening. Which is much different than the [Tigress CFF](https://0xnoo3.github.io/posts/taming-obfuscation/#tigress-cff) we dealt with. This flattening is without the jump table, hence our will be a bit different here, as we don't have entries of original basic blocks from the jump table. we have the identify the original basic blocks via the CFG design.
 
 > Dispatcher
@@ -2860,7 +3212,7 @@ for addr in funcs: # all the functions we got from IDA (except the library funcs
     asm_cfg = mdis.dis_multiblock(addr) 
 
     flattening_score = calc_flattening_score(asm_cfg, loc_db) 
-    if flattening_score > 0.7: # this condition after i noticed that all functions that were below 7 we not obfuscated
+    if flattening_score > 0.7: # this condition after i noticed that all functions that were below 7 were not obfuscated
         print(f"flattening score {flattening_score} for function {hex(addr)}") 
         flat.append(addr) 
 
@@ -2868,6 +3220,645 @@ print(flat) # all the flattened functions.
 
 ```
 
+Now we got all the flattened functions, and we will iterate through the flattened function addresses and then find each flattened functions dispatcher and pre-dispatcher locations. As pre-dispatcher is the basic block with maximum number of predecessors (there are some exception you will see later), and the successors of pre-dispatcher is the dispatcher block. So we have to find the basic block which has the highest number of predecessors that will be our pre-dispatcher and then its successor is the dispatcher block.
+
+```py
+pre_disp_loc = max(asmcfg.blocks, key=lambda key: len(asmcfg.predecessors(key.loc_key))).loc_key  # getting the pre-disp location
+disp_loc = asmcfg.successors(pre_disp_loc) # expected successor.
+assert len(disp_loc) == 1 # the pre-disp has only one successor
+disp_addr_loc = disp_loc[0] 
+
+```
+
+And now we are good to go? just perform the iteration and each funciton will be deobfuscated. *WRONG*
+
+```shell
+imagebase:  0x140000000
+0x140001000  ->  0x140001036 0x140001715
+CMOVNZ   0x14000146e CC_EQ(zf)?(loc_key_56,loc_key_55)
+CMOVZ   0x1400015da CC_EQ(zf)?(loc_key_53,loc_key_54)
+CMOVZ   0x1400014f1 CC_EQ(zf)?(loc_key_57,loc_key_58)
+0x140001720  ->  0x140001751 0x140001bb6
+CMOVNZ   0x140001a78 CC_EQ(zf)?(loc_key_40,loc_key_39)
+CMOVZ   0x140001afa CC_EQ(zf)?(loc_key_41,loc_key_42)
+0x140001bc0  ->  0x140001bfa 0x1400022eb
+CMOVNZ   0x1400020c2 CC_EQ(zf)?(loc_key_59,loc_key_58)
+CMOVZ   0x140002145 CC_EQ(zf)?(loc_key_62,loc_key_63)
+CMOVZ   0x140002193 CC_EQ(zf)?(loc_key_60,loc_key_61)
+0x1400022f0  ->  0x140002485 0x140002483
+Traceback (most recent call last):
+  File "/home/xyz/working/deob/miasm_101/slow/cff_slowtempest.py", line 238, in <module>
+    deobfuscate(addr=addr)
+  File "/home/xyz/working/deob/miasm_101/slow/cff_slowtempest.py", line 161, in deobfuscate
+    state_variable = disp_block.lines[0].get_args_expr()[1]
+                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^
+IndexError: list index out of range
+
+```
+
+I added the debug print that shows on which function we are currently at what are its dispatcher are predispatcher block addresses. So lets visit the function at 0x1400022f0
+
+![](2026-08-13-16-23-40.png)
+_exception_
+
+It identified the predipatcher incorrectly, It has the same numbers of predecessors as the pre-dispatcher has. But it comes first due to the BFS traversal of asmcfg.blocks order. So to counter this exception we have to see if the dispatchers first instruction is a `jmp` than we will find the second max block which will give us the pre-dispatcher.
+
+```py
+pre_disp_loc = sorted(asmcfg.blocks, key=lambda key: len(asmcfg.predecessors(key.loc_key)), reverse=True)[0].loc_key 
+disp_loc = asmcfg.successors(pre_disp_loc) 
+assert len(disp_loc) == 1 
+disp_addr_loc = disp_loc[0] 
+print(hex(addr), ' -> ', hex(loc_db.get_location_offset(disp_addr_loc)), hex(loc_db.get_location_offset(pre_disp_loc))) # debug
+check_dispatcher = asmcfg.loc_key_to_block(disp_addr_loc)
+
+if check_dispatcher.lines[-1].name == 'JMP':
+    pre_disp_loc = sorted(asmcfg.blocks, key=lambda key: len(asmcfg.predecessors(key.loc_key)), reverse=True)[1].loc_key # getting the second max block which was left behind due to BFS on asmcfg.blocks
+    disp_loc = asmcfg.successors(pre_disp_loc) 
+    assert len(disp_loc) == 1 
+    disp_addr_loc = disp_loc[0] 
+    print('Fixed exception', hex(addr), ' -> ', hex(loc_db.get_location_offset(disp_addr_loc)), hex(loc_db.get_location_offset(pre_disp_loc)))
+```
+
+Ok so now the wrong pre-dispatcher and dispatcher identification is fixed. But we got another one.
+
+```shell
+imagebase:  0x140000000
+0x140001000  ->  0x140001036 0x140001715
+STATE:  @64[RSP + 0x28]
+CMOVNZ   0x14000146e CC_EQ(zf)?(loc_key_56,loc_key_55)
+CMOVZ   0x1400015da CC_EQ(zf)?(loc_key_53,loc_key_54)
+CMOVZ   0x1400014f1 CC_EQ(zf)?(loc_key_57,loc_key_58)
+0x140001720  ->  0x140001751 0x140001bb6
+STATE:  @64[RSP + 0x28]
+CMOVNZ   0x140001a78 CC_EQ(zf)?(loc_key_40,loc_key_39)
+CMOVZ   0x140001afa CC_EQ(zf)?(loc_key_41,loc_key_42)
+0x140001bc0  ->  0x140001bfa 0x1400022eb
+STATE:  @64[RSP + 0x30]
+CMOVNZ   0x1400020c2 CC_EQ(zf)?(loc_key_59,loc_key_58)
+CMOVZ   0x140002145 CC_EQ(zf)?(loc_key_62,loc_key_63)
+CMOVZ   0x140002193 CC_EQ(zf)?(loc_key_60,loc_key_61)
+0x1400022f0  ->  0x140002485 0x140002483
+Fixed exception 0x1400022f0  ->  0x14000231c 0x140002549
+STATE:  @64[RSP + 0x30]
+CMOVNZ   0x14000248a CC_EQ(zf)?(loc_key_22,loc_key_21)
+0x140002550  ->  0x140002e3e 0x140002e3c
+Fixed exception 0x140002550  ->  0x14000275f 0x140003648
+STATE:  @64[RSP + 0xC0]
+CMOVNZ   0x140002e43 CC_EQ(zf)?(loc_key_112,loc_key_111)
+CMOVZ   0x140003022 CC_EQ(zf)?(loc_key_117,loc_key_118)
+CMOVNZ   0x140003219 CC_EQ(zf)?(loc_key_116,loc_key_115)
+Traceback (most recent call last):
+  File "/home/xyz/working/deob/miasm_101/slow/cff_slowtempest.py", line 248, in <module>
+    deobfuscate(addr=addr)
+  File "/home/xyz/working/deob/miasm_101/slow/cff_slowtempest.py", line 204, in deobfuscate
+    curr_state_val = int(sb.eval_expr(state_variable))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: int() argument must be a string, a bytes-like object or a real number, not 'ExprMem'
+```
+
+I added the debug print again in OBB to check in which basic block the crash occurs the the state variable is ExprMem.
+
+```shell
+
+debug:  0x140002f77 0xA7D2E3F6154E686C @64[RSP + 0xC0] <class 'miasm.expression.expression.ExprInt'>
+debug:  0x140002f93 0xA7D2E3F62A1F3701 @64[RSP + 0xC0] <class 'miasm.expression.expression.ExprInt'>
+debug:  0x140002fd5 0xA7D2E3F62A1F3701 @64[RSP + 0xC0] <class 'miasm.expression.expression.ExprInt'>
+debug:  0x140002fff 0xA7D2E3F62A1F3701 @64[RSP + 0xC0] <class 'miasm.expression.expression.ExprInt'>
+debug:  0x140003022 0xA7D2E3F62A1F3701 @64[RSP + 0xC0] <class 'miasm.expression.expression.ExprInt'>
+CMOVZ   0x140003022 CC_EQ(zf)?(loc_key_117,loc_key_118)
+debug:  0x140003196 0xA7D2E3F6A124348D @64[RSP + 0xC0] <class 'miasm.expression.expression.ExprInt'>
+debug:  0x1400031b1 0xA7D2E3F6A124348D @64[RSP + 0xC0] <class 'miasm.expression.expression.ExprInt'>
+debug:  0x1400031cd 0xA7D2E3F6651362FD @64[RSP + 0xC0] <class 'miasm.expression.expression.ExprInt'>
+debug:  0x1400031f4 0xA7D2E3F6651362FD @64[RSP + 0xC0] <class 'miasm.expression.expression.ExprInt'>
+debug:  0x140003219 0xA7D2E3F6651362FD @64[RSP + 0xC0] <class 'miasm.expression.expression.ExprInt'>
+CMOVNZ   0x140003219 CC_EQ(zf)?(loc_key_116,loc_key_115)
+debug:  0x140003397 0xA7D2E3F693812698 @64[RSP + 0xC0] <class 'miasm.expression.expression.ExprInt'>
+debug:  0x14000346d @64[call_func_stack(0x140008840, RSP_init) + 0xC0] @64[RSP + 0xC0] <class 'miasm.expression.expression.ExprMem'>
+Traceback (most recent call last):
+  File "/home/xyz/working/deob/miasm_101/slow/cff_slowtempest.py", line 252, in <module>
+    deobfuscate(addr=addr)
+  File "/home/xyz/working/deob/miasm_101/slow/cff_slowtempest.py", line 205, in deobfuscate
+    curr_state_val = int(sb.eval_expr(state_variable))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: int() argument must be a string, a bytes-like object or a real number, not 'ExprMem'
+```
+
+So it crashed on 0x14000346d
+
+![](2026-08-13-18-49-37.png) 
+
+The final state at the end of the Basic block the state calculation is not determined between this block just the last split, but the crash is before that, so i just restored the previous state if the state is an ExprMem. 
+
+```py
+
+evaluated_state = sb.eval_expr(state_variable)
+
+if isinstance(evaluated_state, ExprInt): # we need exprint states
+    curr_state_val = evaluated_state
+    last_good_state_val = curr_state_val  # update previous state
+
+elif isinstance(evaluated_state, ExprMem):
+    print('changing state: ', hex(loc_db.get_location_offset(curr_addr_loc)), sb.eval_expr(last_good_state_val), sb.eval_expr(state_variable))
+    sb.symbols[state_variable] = last_good_state_val
+    curr_state_val = last_good_state_val
+
+```
+
+This fixed the state variable not being ExprInt problem, and this is the example that there are several problems and edge cases always as i was working through the whole deobfuscator which also there were cases were original basic blocks were needed more pattern matching analysis. I was also not running the symbolic execution in a loop inside a cmovcc IR Block, that caused problems. So after many refactoring and fixing finally we ran the code.
+
+<video src="/assets/posts/2026-08-08-taming-obfuscation/cff_deob.webm" controls style="max-width: 100%; height: auto;"></video>
+
+Deobfuscation complete, the functions are unflattened and now only indirect call obfuscation is left.
+
+<video src="/assets/posts/2026-08-08-taming-obfuscation/unflatten.webm" controls style="max-width: 100%; height: auto;"></video>
+_Unflattened Binary_
+
+This is the whole deobfuscation script, as the snippets i gave they were before fixing some issues so they were not part of the class, as i was doing it without a class but those explain the core functionality of the deobfuscator. The  Binrewriter can be found [here](https://gist.github.com/0xNoo3/c879a676e19d8f2a879f89165424a781#file-06_writers-py-L215) 
+
+```py
+from miasm.analysis.binary import Container
+from miasm.analysis.machine import Machine
+from miasm.core.locationdb import LocationDB, LocKey
+from miasm.expression.simplifications import ExpressionSimplifier, expr_simp
+from miasm.arch.x86.regs import all_regs_ids, all_regs_ids_init
+from miasm.expression.expression import ExprCond, ExprMem, ExprInt, ExprLoc, ExprVisitorCallbackTopToBottom
+from miasm.ir.symbexec import SymbolicExecutionEngine
+from collections import deque, defaultdict
+from cff_patcher import BinaryRewriter
+import shutil
+import struct
+import lief
+
+class deob_slowtempest:
+    def __init__(self, file='slowtempest.cff_deob.bin', out=None):
+        self.file = file
+        self.out = out if out is not None else file
+
+        self.pe = lief.PE.parse(file)
+        print('imagebase: ', hex(self.pe.imagebase))
+        data_section = self.pe.get_section('.data')
+
+        self.u64 = lambda data, i: struct.unpack('<Q', data[i:i + 8])[0]
+        self.u32 = lambda data, i: struct.unpack('<I', data[i:i + 4])[0]
+
+        # concrete values of the .data section
+        self.concreteSymbols = {}
+        self.add_data(self.concreteSymbols, data_section.virtual_address + self.pe.imagebase, bytes(data_section.content))
+
+        self.custom_simp = ExpressionSimplifier()
+        self.custom_simp.enable_passes(ExpressionSimplifier.PASS_COMMONS)
+        self.custom_simp.enable_passes(ExpressionSimplifier.PASS_HIGH_TO_EXPLICIT)
+        self.custom_simp.enable_passes({ExprMem: [self.simpExprMem]})
+
+    def add_data(self, symb, offset, data):
+        for i in range(0, len(data), 8):
+            symb[ExprMem(ExprInt(offset + i, 64), 64)] = ExprInt(self.u64(data, i), 64)
+        for i in range(0, len(data), 4):
+            symb[ExprMem(ExprInt(offset + i, 32), 32)] = ExprInt(self.u32(data, i), 32)
+
+    def simpExprMemCallBack(self, expr):
+        if isinstance(expr, ExprMem):
+            if expr in self.concreteSymbols:
+                newExpr = expr.replace_expr({expr: self.concreteSymbols[expr]})
+                return newExpr
+        return None
+
+    def simpExprMem(self, _, expr):
+        # https://github.com/cea-sec/miasm/blob/master/miasm/expression/expression.py#L614
+        visitor = ExprVisitorCallbackTopToBottom(lambda expr: self.simpExprMemCallBack(expr))
+        return visitor.visit(expr)
+
+    def deobfuscate(self, addr):
+
+        loc_db = LocationDB()
+        container = Container.from_stream(open(self.file, 'rb'), loc_db=loc_db)
+        machine = Machine(container.arch)
+        lifter = machine.lifter_model_call(loc_db=loc_db)
+        mdis = machine.dis_engine(container.bin_stream, loc_db=loc_db)
+        asmcfg = mdis.dis_multiblock(addr)
+        ircfg = lifter.new_ircfg_from_asmcfg(asmcfg=asmcfg)
+
+        self.loc_db = loc_db
+        self.asmcfg = asmcfg
+        self.ircfg = ircfg
+        self.lifter = lifter
+
+        pre_disp_loc = sorted(asmcfg.blocks, key=lambda key: len(asmcfg.predecessors(key.loc_key)), reverse=True)[0].loc_key
+        disp_loc = asmcfg.successors(pre_disp_loc)
+        assert len(disp_loc) == 1
+        disp_addr_loc = disp_loc[0]
+        print(hex(addr), ' -> ', hex(loc_db.get_location_offset(disp_addr_loc)), hex(loc_db.get_location_offset(pre_disp_loc)))
+
+        check_dispatcher = asmcfg.loc_key_to_block(disp_addr_loc)
+
+        if check_dispatcher.lines[-1].name == 'JMP': # fixing the exception
+            pre_disp_loc = sorted(asmcfg.blocks, key=lambda key: len(asmcfg.predecessors(key.loc_key)), reverse=True)[1].loc_key
+            disp_loc = asmcfg.successors(pre_disp_loc)
+            assert len(disp_loc) == 1
+            disp_addr_loc = disp_loc[0]
+            print('Fixed exception', hex(addr), ' -> ', hex(loc_db.get_location_offset(disp_addr_loc)), hex(loc_db.get_location_offset(pre_disp_loc)))
+
+        OBB = self.findOBB(pre_disp_loc)
+
+        # the state variable read by the dispatcher, e.g. @64[RSP + 0x18]
+        disp_block = asmcfg.loc_key_to_block(disp_addr_loc)
+        state_variable = disp_block.lines[0].get_args_expr()[1]
+        print('STATE: ', state_variable)
+
+        init_symbols = {}
+        for i, r in enumerate(all_regs_ids):
+            init_symbols[r] = all_regs_ids_init[i]
+
+        state_to_state_map = defaultdict(list)
+        state_to_addr_map = defaultdict(list)
+        first_state_val = None
+        q = deque([(loc_db.get_offset_location(addr), first_state_val, init_symbols)])
+        visited_location = set()
+
+        while q:
+            curr_addr_loc, curr_state_val, symbols = q.popleft()
+            sb = SymbolicExecutionEngine(lifter, symbols, sb_expr_simp=self.custom_simp)
+            while True:
+                r = self.symbolic_execution(sb, curr_addr_loc)
+                if r is None:
+                    break
+
+                if r.is_cond():
+                    cond_true = {r.cond: ExprInt(1, 32)}; cond_false = {r.cond: ExprInt(0, 32)}
+                    jt = self.to_loc_key(expr_simp(sb.eval_expr(r.replace_expr(cond_true), {})))
+                    jf = self.to_loc_key(expr_simp(sb.eval_expr(r.replace_expr(cond_false), {})))
+                    q.append((jf, curr_state_val, sb.symbols.copy()))  # false branch for later
+                    curr_addr_loc = jt
+                else:
+                    curr_addr_loc = self.to_loc_key(expr_simp(sb.eval_expr(r)))
+
+                if curr_addr_loc in OBB:
+                    evaluated_state = sb.eval_expr(state_variable)
+                    if isinstance(evaluated_state, ExprInt):  # we need exprint states
+                        curr_state_val = evaluated_state
+                        last_good_state_val = curr_state_val  # update previous state
+                    elif isinstance(evaluated_state, ExprMem):
+                        print('changing state: ', hex(loc_db.get_location_offset(curr_addr_loc)), sb.eval_expr(last_good_state_val), sb.eval_expr(state_variable))
+                        sb.symbols[state_variable] = last_good_state_val
+                        curr_state_val = last_good_state_val
+                    else:
+                        print('state is some other type')
+                    curr_state_val = int(curr_state_val)
+
+                    if (curr_addr_loc, curr_state_val) in visited_location:
+                        break
+                    visited_location.add((curr_addr_loc, curr_state_val))
+                    # print('debug: ', hex(loc_db.get_location_offset(curr_addr_loc)), sb.eval_expr(state_variable), state_variable, type(sb.eval_expr(state_variable)))
+
+                    # check if the current address is already added in the correspinding state list
+                    if curr_addr_loc not in state_to_addr_map[curr_state_val]:
+                        state_to_addr_map[curr_state_val].append(curr_addr_loc)
+
+                    if first_state_val is None:
+                        first_state_val = curr_state_val
+
+                elif curr_addr_loc == pre_disp_loc:
+                    nState_val = int(sb.eval_expr(state_variable))
+
+                    if nState_val not in state_to_state_map[curr_state_val]:
+                        state_to_state_map[curr_state_val].append(nState_val)
+                    curr_state_val = None
+
+        # keep only the state blocks + prologue, drop the dispatcher tree 
+        OBB = []
+        for locations in state_to_addr_map.values():
+            for loc in locations:
+                OBB.append(loc)
+
+        state_to_state_map[0].append(first_state_val)
+
+        for loc in asmcfg.predecessors(disp_addr_loc):
+            if loc == pre_disp_loc: # skipping the pre-dispatcher because its also predecessors
+                continue
+            func_prologue = loc # then the predecessors is function prologue 
+            OBB.append(func_prologue)
+            state_to_addr_map[0].append(func_prologue)
+            # chaining the prologue if its split.
+            prev_prologue_block = asmcfg.predecessors(func_prologue)
+            if len(prev_prologue_block) == 0:
+                break
+            while len(prev_prologue_block) != 0:
+                OBB.append(prev_prologue_block[0])
+                state_to_addr_map[0].append(prev_prologue_block[0])
+                assert len(prev_prologue_block) == 1
+                prev_prologue_block = asmcfg.predecessors(prev_prologue_block[0])
+            break  # because we have the function prologue blocks
+
+        self.remove_irrelevant_BB(original_BB=OBB)
+
+        state_to_addr_map[0] = state_to_addr_map[0][::-1]  # correct the order of function prologue
+
+        # patche function
+        rewriter = BinaryRewriter(container.arch, original_filename=self.file,
+                                  va_function_lief=lambda addr: self.pe.va_to_offset(addr))
+        rewriter.patch_binary(asmcfg, addr, state_to_state_map, state_to_addr_map, sb, out_filename=self.out)
+
+    def to_loc_key(self, expr):
+        if isinstance(expr, LocKey):
+            return expr
+        if isinstance(expr, ExprLoc):
+            return expr.loc_key
+        if isinstance(expr, int):
+            return self.loc_db.get_offset_location(expr)
+        if isinstance(expr, ExprInt):
+            return self.loc_db.get_offset_location(int(expr))
+        return None
+
+    def remove_irrelevant_BB(self, original_BB):
+        irrelevant_locations = []
+        for bb in self.asmcfg.blocks:
+            if bb.loc_key not in original_BB:
+                irrelevant_locations.append(bb.loc_key)
+        for loc in irrelevant_locations:
+            self.asmcfg.del_block(self.asmcfg.loc_key_to_block(loc))
+
+    def fallthrough_preds(self, loc):
+        preds = self.asmcfg.predecessors(loc)
+        if len(preds) <= 1:
+            return preds
+        ft = [p for p in preds if not self.asmcfg.loc_key_to_block(p).lines[-1].name.startswith('J')]
+        return ft if ft else preds
+
+    def findOBB(self, pre_disp_loc):
+        OBB = []
+        # for original basic blocks
+        for curr_loc in self.asmcfg.predecessors(pre_disp_loc):
+            pre_obb_loc = self.fallthrough_preds(curr_loc); OBB.append(curr_loc)
+            assert len(pre_obb_loc) == 1
+            while True:
+                pre_obb_block = self.asmcfg.loc_key_to_block(pre_obb_loc[0])
+                if pre_obb_block.lines[-1].name.startswith('J'):
+                    break
+                curr_loc = pre_obb_loc[0]
+                pre_obb_loc = self.fallthrough_preds(curr_loc)
+                assert len(pre_obb_loc) == 1
+                OBB.append(curr_loc)
+
+        # for ret basic blocs/tail calls
+        for bb in self.asmcfg.blocks:
+            ret_loc = bb.loc_key
+            if len(self.asmcfg.successors(ret_loc)) == 0:
+                ret_pre_loc = self.fallthrough_preds(ret_loc); OBB.append(ret_loc)
+                assert len(ret_pre_loc) == 1
+                while True:
+                    ret_pre_block = self.asmcfg.loc_key_to_block(ret_pre_loc[0])
+                    if ret_pre_block.lines[-1].name.startswith('J'):
+                        break
+                    ret_loc = ret_pre_loc[0]
+                    ret_pre_loc = self.fallthrough_preds(ret_loc)
+                    assert len(ret_pre_loc) == 1
+                    OBB.append(ret_loc)
+
+        return OBB
+
+    def symbolic_execution(self, sb, address_loc):
+        cmp_ins = None
+        cmovcc_ins = None
+        current_asm_block = self.asmcfg.loc_key_to_block(address_loc)
+        if current_asm_block is None:
+            return sb.run_block_at(ircfg=self.ircfg, addr=address_loc)
+        for ins in current_asm_block.lines:
+            if ins.name == 'IDIV':
+                address_loc = ins.offset + ins.l  # skipped the idiv instruction execution (a cheap fix xD)
+            elif ins.name in ['CMP', 'TEST']:
+                cmp_ins = ins
+            elif ins.name.startswith('CMOV'):
+                cmovcc_ins = ins
+                break
+
+        if current_asm_block.lines[-1].name == 'CALL':
+            rsp = sb.symbols[self.lifter.arch.regs.RSP]; rbp = sb.symbols[self.lifter.arch.regs.RBP]
+            r = sb.run_block_at(ircfg=self.ircfg, addr=address_loc)
+            sb.symbols[self.lifter.arch.regs.RSP] = rsp; sb.symbols[self.lifter.arch.regs.RBP] = rbp
+            return r
+
+        if cmovcc_ins is not None and cmp_ins is not None:
+            curr_loc = address_loc
+            while True:
+                current_ir_block = self.ircfg.get_block(addr=curr_loc)
+                for ir_ins in current_ir_block:
+                    if ir_ins.instr.name.startswith('CMOV'):
+                        cmov_cond_expr = ir_ins.values()[-1]
+                        sb.run_block_at(ircfg=self.ircfg, addr=curr_loc)  # this was fixed later. (without this the ir block execution is not valid/reliable)
+                        if str(cmovcc_ins).startswith('CMOVN'):
+                            print(ir_ins.instr.name, ' ', hex(self.loc_db.get_location_offset(self.to_loc_key(curr_loc))), cmov_cond_expr)
+                            return cmov_cond_expr.copy()
+                        print(ir_ins.instr.name, ' ', hex(self.loc_db.get_location_offset(self.to_loc_key(curr_loc))), cmov_cond_expr)
+                        return ExprCond(cmov_cond_expr.cond.copy(), cmov_cond_expr.src2.copy(), cmov_cond_expr.src1.copy())  # flip the condition
+                curr_loc = sb.run_block_at(ircfg=self.ircfg, addr=curr_loc)
+        else:
+            return sb.run_block_at(ircfg=self.ircfg, addr=address_loc)
+
+
+if __name__ == '__main__':
+
+    shutil.copy("slowtempest.jmp_deob.bin", "slowtempest.cff_deob.bin")
+
+    deob = deob_slowtempest()
+                
+    for addr in [0x140001000,0x140001720,0x140001bc0,0x1400022f0,0x140002550,0x140003990,0x140003e30,0x140004dd0,0x1400051f0,0x1400055c0,0x140005970,0x140005c30,0x140006590,0x140007200,0x140007790,0x140007d30,0x1400082c0,0x140008840,0x140008dc0,0x140009350,0x1400098d0,0x140009e40,0x14000a3c0,0x14000a950,0x14000afb0,0x14000b260,0x14000bdb0,0x14000c3b0,0x14000c930,0x14000d040,0x14000dbc0,0x14000df90,0x14000f0f0,0x14000f780,0x14000ff30,0x140010600,0x1400115c0,0x140011b40,0x1400120d0,0x1400128c0,0x140014120,0x140016780,0x140016d30,0x1400179e0,0x140017d90,0x1400184c0,0x140018920,0x140018f10,0x1400199e0,0x140019bf0,0x14001a2b0,0x14001a5d0,0x14001ac90,0x14001b170,0x14001b670,0x14001bae0,0x14001c100,0x14001c500,0x14001c730,0x14001c950,0x14001d060,0x14001d7f0,0x14001e050,0x14001e4f0,0x14001f8f0,0x14001fc50,0x140021970,0x140021d70,0x140022930,0x140023300,0x140023660,0x1400240e0,0x140024810,0x140024ce0,0x140025150,0x140025d20,0x140026660,0x140026be0,0x140027170,0x140027700,0x140027c90,0x140028210,0x1400287a0,0x140028d20,0x1400292a0,0x140029830,0x140029dc0,0x14002a350,0x14002a8d0,0x14002ae50,0x14002b530,0x14002bd40,0x14002c300,0x14002caa0,0x14002d360,0x14002ee20,0x14002f550,0x14002f7c0,0x1400303f0,0x140031a10,0x1400325f0,0x140032ad0,0x140033260,0x1400337f0,0x140033d70,0x140034330,0x140034d60,0x1400352d0,0x1400355b0,0x140035d70,0x140036bb0,0x140037240,0x14003f830,0x14003fe60,0x1400403f0,0x140040970,0x140040f00,0x1400422c0,0x140042da0,0x140043660,0x140043b30,0x1400441a0,0x140044720,0x140044cb0,0x140045230,0x1400457c0,0x140045d40,0x140045fc0,0x140046240,0x1400465f0,0x140046d30,0x140047160,0x1400474d0,0x1400480d0,0x1400483d0,0x1400495d0,0x140049e50,0x14004a3d0,0x14004a950,0x14004aee0,0x14004b470,0x14004b9f0,0x14004c1f0,0x14004c4e0,0x14004c830,0x14004cba0,0x14004d270,0x14004d4d0,0x14004d7f0,0x14004db10,0x14004dfa0,0x14004e470,0x14004e980,0x14004ed50,0x14004f190,0x14004f680,0x14004fb10,0x1400506a0,0x140050e80,0x1400517c0,0x140052140,0x140052680,0x140053e80,0x140054230,0x140054870,0x140054e00,0x140055390,0x140055910,0x140055e90,0x140056410]:# the function address we got from 7+ flatttening score. (some functions were false positives btw, and tbh i don't know why xD)
+        deob.deobfuscate(addr=addr)
+    print('written: ', deob.out)
+
+```
+
+
+## Indirect Call Obfuscation
+
+The binary has compelete indirect call obfuscation.
+
+![](2026-08-13-22-19-32.png)
+_Indirect Call Obfuscation_
+
+```py
+import idc 
+
+ea = 0x140001000 # start of text section 
+ind = [] 
+while ea < 0x140057495: # end of text section 
+    if idc.print_insn_mnem(ea) == 'call' and idc.get_operand_type(ea, 0) is idc.o_reg: # call reg 
+        print(hex(ea)); ind.append(ea) 
+    ea = idc.next_head(ea) 
+print('indirect calls: ', len(ind)) 
+```
+
+```shell
+indirect calls:  945 
+```
+
+But as this is the last section of the post and we have extensively used miasm and its capabilities, I wanted to do it differently, So we will use hexrays decompiler hooks to manipulate [microcode](https://hex-rays.com/blog/microcode-in-pictures) hexrays own IR, and by using [hexrays api](https://cpp.docs.hex-rays.com/hexrays_8hpp_source.html) we can easily manipulate different stages of microcode with out custom optimizations which can strip away intended obfuscation.
+
+![](2026-08-13-22-42-02.png)
+_indirect calls pattern_
+
+fortunately enough for our sample the indirect call pattern is not complicated, first rax is loaded with a constant, and then it added with another constant which will be read from the `.data` section.
+
+![](2026-08-13-22-44-55.png)
+_Global constants_
+
+### Hexrays Microcode
+
+Microcode has different maturity levels. Each maturity level apply specific type of optimizations. 
+
+
+First one is MMAT GENERATED. It preserves all the eflag semantics per instruction. Its the first microcode layer which is generated.
+
+![](2026-08-13-22-54-48.png)
+_MMAT GENERATED_
+
+Second is MMAT PREOPTIMIZED. [Use-Def](https://en.wikipedia.org/wiki/Use-define_chain) info is used to do deadcode removal and constant propagation. 
+
+![](2026-08-13-22-58-24.png)
+_MMAT PREOPTIMIZED_
+
+Third is MMAT LOCOPT. This what we will deal with today and manipulate via decompiler hook.
+
+![](2026-08-13-23-01-52.png)
+_MMAT LOCOPT_
+
+
+There are other layers as well but we will only deal with `LOCOPT`. You can read about microcode [here](https://gist.github.com/icecr4ck/6c744d489efbb07a32bb22e8a3c748e3).
+
+If you want to play with microcode you need to know its various classes and their members only than you know the functionality of what can be done.
+
+If you want to play with microcode instructions which are [misn_t](https://cpp.docs.hex-rays.com/classminsn__t.html)
+
+```c
+[...]
+class minsn_t
+{
+  void hexapi init(ea_t _ea);
+  void hexapi copy(const minsn_t &m);
+public:
+  mcode_t opcode;       
+  int iprops;           
+  minsn_t *next;        
+  minsn_t *prev;        
+  ea_t ea;              
+  mop_t l;              
+  mop_t r;              
+  mop_t d;              
+[...]
+
+```
+
+And the operands which are [mop_t](https://cpp.docs.hex-rays.com/classmop__t.html)
+
+```c
+//-------------------------------------------------------------------------
+class mop_t
+{
+  void hexapi copy(const mop_t &rop);
+public:
+  mopt_t t;
+  uint8 oprops;
+#define OPROP_IMPDONE 0x01 
+#define OPROP_UDT     0x02 
+#define OPROP_FLOAT   0x04 
+#define OPROP_CCFLAGS 0x08 
+#define OPROP_UDEFVAL 0x10 
+#define OPROP_LOWADDR 0x20 
+#define OPROP_ABI     0x40 
+  uint16 valnum;
+  int size;
+  union
+  {
+    mreg_t r;           // mop_r   register number
+    mnumber_t *nnn;     // mop_n   immediate value
+    minsn_t *d;         // mop_d   result (destination) of another instruction
+    stkvar_ref_t *s;    // mop_S   stack variable
+    ea_t g;             // mop_v   global variable (its linear address)
+    int b;              // mop_b   block number (used in jmp,call instructions)
+    mcallinfo_t *f;     // mop_f   function call information
+    lvar_ref_t *l;      // mop_l   local variable
+    mop_addr_t *a;      // mop_a   variable whose address is taken
+    char *helper;       // mop_h   helper function name
+    char *cstr;         // mop_str utf8 string constant, user representation
+    mcases_t *c;        // mop_c   cases
+    fnumber_t *fpc;     // mop_fn  floating point constant
+    mop_pair_t *pair;   // mop_p   operand pair
+    scif_t *scif;       // mop_sc  scattered operand info
+  };
+  // -- End of data fields, member function declarations follow:
+[...]
+
+```
+
+Only with this information we start playing with microcode.
+
+![](2026-08-13-23-25-28.png)
+_locopt_
+
+We can see that the icall is formed by just addition of a global constant with another constant. We will make two classes one for the decompiler hook and the other which visit the instructions and optimizer, Which will just replace the global data reference with the constant one so that constant propagation can be applied to it and the decompiler will see the constant propagated final IR so we will se indirect call deobfuscation in our decompiler.
+
+```py
+import idaapi
+import ida_hexrays
+
+dataStart = 0x14007E000
+dataEnd = 0x140093FFF
+simplify = False
+
+class operand_optimizer(ida_hexrays.minsn_visitor_t):
+    def visit_minsn(self):
+        global simplify
+        insn = self.curins # the current instruction (minsn_t) to be visited 
+
+        if insn.opcode in (ida_hexrays.m_add, ida_hexrays.m_sub): # memory operands that appear as operands of an add/sub
+            for op in (insn.l, insn.r): 
+                # we can see these in the reference i provided and also can see ida sdk for hexrays.hpp
+                if op.t == ida_hexrays.mop_v and op.size == 8 and op.g >= dataStart and op.g <= dataEnd:
+                    ea = op.g
+                    const = int.from_bytes(idaapi.get_bytes(ea,8),byteorder="little") # reading the global constant
+                    op.make_number(const, 8) # making it constant
+                    if self.blk:
+                        self.blk.mark_lists_dirty()
+                    simplify = True # used in the decompiler hook
+        return 0
+
+class DecompilerHook(ida_hexrays.Hexrays_Hooks):
+    def locopt(self, mba):
+        #walk through the mblocks
+        global simplify
+
+        simplify = True
+        while simplify:
+            simplify = False
+            repl = operand_optimizer()
+            mba.for_all_insns(repl)
+            mba.optimize_local(0)
+
+        mba.verify(True) # verify microcode 
+        print("Verified")
+        return 0
+
+event_hook = DecompilerHook()
+event_hook.hook()
+
+```
+
+![](2026-08-13-22-19-32.png)
+_Before_
+
+![](2026-08-14-02-39-10.png)
+_After_
+
+We have come a long way, From a very obfuscated binary where there was only `jmp rax` in the decompiler to `CFF` to `unflatten` and then `resolved indirect calls`. We have made so far ! <3
+
+Here is the Deobfuscated binary :p
+
+<video src="/assets/posts/2026-08-08-taming-obfuscation/call.webm" controls style="max-width: 100%; height: auto;"></video>
+_Clean Deobfuscated Functions_
+
+
+## What's Next !?
+
+We missed a very hot topic in obfuscations which is MBA we will use [Triton](https://github.com/JonathanSalwan/Triton) and [Cobra](https://github.com/trailofbits/CoBRA), It requires its own post. I will also write about deobfuscation via LLVM IR using [Remil](https://github.com/lifting-bits/remill). So stay tuned, See you soon. 
 
 
 
